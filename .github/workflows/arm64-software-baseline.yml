@@ -53,7 +53,7 @@ jobs:
           python -m unittest tests.arm64.unit_generators -v
 
           
-      - name: Compile ARM64 kernel module (diagnostic)
+      - name: Compile ARM64 kernel module
         shell: bash
         working-directory: rvzr/executor_km
         run: |
@@ -82,5 +82,39 @@ jobs:
           test -s rvzr_executor.ko
 
           echo "ARM64 kernel module compiled successfully"
+
+          
+      - name: Compile ARM64 kernel module with PMU setup
+        continue-on-error: true
+        shell: bash
+        working-directory: rvzr/executor_km
+        run: |
+          set -euo pipefail
+
+          kernel_build="/lib/modules/$(uname -r)/build"
+
+          echo "Building ARM64 executor without VMBUILD"
+          echo "Kernel: $(uname -r)"
+
+          # Remove objects from the previous VMBUILD build
+          make -C "$kernel_build" \
+            M="$PWD" \
+            ARCH=arm64 \
+            VMBUILD= \
+            clean
+
+          # Compile with PMU initialization included
+          make -C "$kernel_build" \
+            M="$PWD" \
+            ARCH=arm64 \
+            VMBUILD= \
+            V=1 \
+            -j"$(nproc)" \
+            modules
+
+          test -s rvzr_executor.ko
+
+          echo "ARM64 kernel module with PMU setup compiled successfully"
+
 
 
