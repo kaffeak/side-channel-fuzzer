@@ -118,9 +118,8 @@ jobs:
 
 
   arm64-kernel-16k:
-    name: Fedora Asahi 16 KB kernel (diagnostic)
+    name: Fedora Asahi 16 KB kernel build
     runs-on: ubuntu-24.04-arm
-    continue-on-error: true
 
     permissions:
       contents: read
