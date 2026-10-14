@@ -117,3 +117,85 @@ jobs:
 
 
 
+  arm64-kernel-16k:
+    name: Fedora Asahi 16 KB kernel (diagnostic)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+
+    permissions:
+      contents: read
+
+    container:
+      image: registry.fedoraproject.org/fedora@sha256:b148221886c7dfc09c5e3d5ec01ec1c51b774b65121709bc7d88d5e6fbee27dd
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install container tools
+        run: |
+          dnf -y install git curl util-linux binutils
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile against Fedora Asahi 16 KB kernel
+        working-directory: rvzr/executor_km
+
+        env:
+          DEVEL_URL: https://download.copr.fedorainfracloud.org/results/@asahi/kernel/fedora-44-aarch64/10130065-kernel/kernel-16k-devel-6.18.10-402.asahi.fc44.aarch64.rpm
+          DEVEL_SHA256: 37e6e53a85f33eda8ec216da52d64a7ca1554d687a389edd48d7abc021816832
+
+        run: |
+          set -euo pipefail
+
+          echo "=== Download kernel development package ==="
+
+          devel_rpm="$RUNNER_TEMP/kernel-16k-devel.rpm"
+
+          curl --fail --location --retry 3 \
+            "$DEVEL_URL" -o "$devel_rpm"
+
+          printf '%s  %s\n' "$DEVEL_SHA256" "$devel_rpm" \
+            | sha256sum --check
+
+          dnf -y install "$devel_rpm"
+
+          echo "=== Verify kernel configuration ==="
+
+          kernel_build="/usr/src/kernels/6.18.10-402.asahi.fc44.aarch64+16k"
+
+          test -s "$kernel_build/Module.symvers"
+
+          grep -qx 'CONFIG_ARM64_16K_PAGES=y' \
+            "$kernel_build/.config"
+
+          grep -qx '#define CONFIG_ARM64_16K_PAGES 1' \
+            "$kernel_build/include/generated/autoconf.h"
+
+          echo "Host architecture: $(uname -m)"
+          echo "Running kernel: $(uname -r)"
+          echo "Host page size: $(getconf PAGESIZE)"
+          echo "Target kernel: $(cat "$kernel_build/include/config/kernel.release")"
+
+          gcc --version | head -n 1
+          rpm -q kernel-16k-devel
+
+          echo "=== Compile Revizor kernel module ==="
+
+          make -C "$kernel_build" \
+            M="$PWD" \
+            ARCH=arm64 \
+            VMBUILD= \
+            -j"$(nproc)" \
+            modules
+
+          test -s rvzr_executor.ko
+
+          echo "=== Verify module ==="
+
+          readelf -h rvzr_executor.ko
+
+          echo "Fedora Asahi 16 KB kernel compilation PASSED"
+
