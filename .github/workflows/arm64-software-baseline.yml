@@ -46,3 +46,10 @@ jobs:
         run: |
           python -m unittest tests.unit_traces -v
           python -m unittest tests.unit_tc_components -v
+
+          
+      - name: Diagnose ARM64 generator tests
+        continue-on-error: true
+        run: |
+          python -m unittest tests.arm64.unit_generators -v
+
