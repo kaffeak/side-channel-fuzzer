@@ -1,0 +1,48 @@
+
+name: ARM64 Software Baseline
+
+on:
+  push:
+    branches:
+      - apple-silicon-linux
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-baseline:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Inspect ARM64 environment
+        run: |
+          uname -m
+          python --version
+          lscpu
+          cat /proc/cpuinfo
+
+      - name: Install Revizor
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip check
+
+      - name: Check Python syntax
+        run: python -m compileall -q rvzr
+
+      - name: Run ARM64 ISA loader test
+        run: python -m unittest tests.arm64.unit_isa_loader -v
+
+      - name: Run selected core unit tests
+        run: |
+          python -m unittest tests.unit_traces -v
+          python -m unittest tests.unit_tc_components -v
