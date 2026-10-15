@@ -115,6 +115,15 @@ jobs:
 
           echo "ARM64 kernel module with PMU setup compiled successfully"
 
+          
+      - name: Verify sandbox geometry and C/Python parity
+        run: |
+          python -m unittest \
+            tests.unit_sandbox_geometry \
+            tests.unit_sandbox_geometry_c \
+            -v
+
+
 
 
   arm64-kernel-16k:
