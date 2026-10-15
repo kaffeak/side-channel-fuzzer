@@ -123,6 +123,10 @@ jobs:
             tests.unit_sandbox_geometry_c \
             -v
 
+      - name: Verify serialized input format
+        run: |
+          python -m unittest tests.unit_input_format -v
+
 
 
 

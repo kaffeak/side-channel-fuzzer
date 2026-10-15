@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Tuple, Optional, List
 import numpy as np
 
+from .. import input_format
 from ..sandbox import SandboxLayout, DataArea
 
 if TYPE_CHECKING:
@@ -22,11 +23,11 @@ InputID = int
 # _ActorInput data type represents the input for a single actor
 _ActorInput = np.dtype(
     [
-        ('main', np.uint64, SandboxLayout.data_area_size(DataArea.MAIN) // 8),
-        ('faulty', np.uint64, SandboxLayout.data_area_size(DataArea.FAULTY) // 8),
-        ('gpr', np.uint64, SandboxLayout.data_area_size(DataArea.GPR) // 8),
-        ('simd', np.uint64, SandboxLayout.data_area_size(DataArea.SIMD) // 8),
-        ('padding', np.uint64, SandboxLayout.data_area_size(DataArea.OVERFLOW_PAD) // 8),
+        ('main', np.uint64, input_format.MAIN_SIZE // input_format.WORD_SIZE),
+        ('faulty', np.uint64, input_format.FAULTY_SIZE // input_format.WORD_SIZE),
+        ('gpr', np.uint64, input_format.GPR_SIZE // input_format.WORD_SIZE),
+        ('simd', np.uint64, input_format.SIMD_SIZE // input_format.WORD_SIZE),
+        ('padding', np.uint64, input_format.PADDING_SIZE // input_format.WORD_SIZE),
     ],
     align=False,
 )
