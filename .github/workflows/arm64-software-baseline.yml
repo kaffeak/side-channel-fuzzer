@@ -123,14 +123,20 @@ jobs:
             tests.unit_sandbox_geometry_c \
             -v
 
+
       - name: Verify serialized input format
         run: |
           python -m unittest tests.unit_input_format -v
+
 
       - name: Verify sandbox descriptor validation
         run: |
           python -m unittest tests.unit_sandbox_descriptor -v
 
+          
+      - name: Characterize sandbox preparation lifecycle
+        run: |
+          python -m unittest tests.unit_preparation_lifecycle -v
 
 
 
