@@ -127,6 +127,10 @@ jobs:
         run: |
           python -m unittest tests.unit_input_format -v
 
+      - name: Verify sandbox descriptor validation
+        run: |
+          python -m unittest tests.unit_sandbox_descriptor -v
+
 
 
 
