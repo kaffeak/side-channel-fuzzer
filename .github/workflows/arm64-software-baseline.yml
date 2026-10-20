@@ -143,6 +143,21 @@ jobs:
         run: |
           python -m unittest tests.unit_cache_observation_semantics -v
 
+      - name: Verify timer protocol and failure handling on host
+        timeout-minutes: 2
+        run: python -m unittest tests.unit_arm64_timer_calibration -v
+
+      - name: Smoke test native ARM64 architectural timer
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            tools/arm64_timer_calibration.c -o "$RUNNER_TEMP/arm64-timer"
+          python tools/verify_arm64_timer.py "$RUNNER_TEMP/arm64-timer" \
+            --output "$RUNNER_TEMP/arm64-timer.jsonl"
+
 
 
   arm64-kernel-16k:
