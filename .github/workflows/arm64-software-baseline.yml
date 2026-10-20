@@ -139,6 +139,11 @@ jobs:
           python -m unittest tests.unit_preparation_lifecycle -v
 
 
+      - name: Characterize cache observation semantics
+        run: |
+          python -m unittest tests.unit_cache_observation_semantics -v
+
+
 
   arm64-kernel-16k:
     name: Fedora Asahi 16 KB kernel build
