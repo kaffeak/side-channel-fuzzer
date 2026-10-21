@@ -250,6 +250,7 @@ static ssize_t trace_show(struct kobject *kobj, struct kobj_attribute *attr, cha
     int count = 0;
     int retval = 0;
 
+    ASSERT(tc_ready && inputs_ready, "trace_show");
     ASSERT(measurements, "trace_show");
     ASSERT(input_parsing_completed(), "trace_show");
     ASSERT(tc_parsing_completed(), "trace_show");

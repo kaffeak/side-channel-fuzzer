@@ -7,6 +7,7 @@ Use unittest -f to stop immediately on instrumented failures; never pad allocati
 
 # pylint: disable=missing-class-docstring,missing-function-docstring
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -83,7 +84,7 @@ def _fixtures(directory: Path) -> Dict[str, Tuple[Path, bytes, int]]:
 
 
 def _callback_unit() -> str:
-    """Extract two exact top-level definitions; fail closed if their shape changes.
+    """Extract exact top-level definitions; fail closed if their shape changes.
 
     This is deliberately not a general C extractor. Only these current definitions
     have an opening/closing brace at column zero and no nested column-zero braces.
@@ -92,10 +93,12 @@ def _callback_unit() -> str:
     path = _KERNEL / "main.c"
     source = path.read_text(encoding="utf-8")
     parts = ['#include "compat.h"\n#include "test_case_parser.h"\n'
+             '#include "input_parser.h"\n'
              '#include "sandbox_manager.h"\n#include "code_loader.h"\n'
              '#include "shortcuts.h"\nstruct kobject;\nstruct kobj_attribute;\n'
-             'extern bool tc_ready;\nextern int next_measurement_id;\n']
-    for name in ("check_test_case_compat", "test_case_store"):
+             'extern bool tc_ready, inputs_ready, unfinished_call;\n'
+             'extern int next_measurement_id;\n']
+    for name in ("check_test_case_compat", "test_case_store", "trace_show"):
         matches = list(re.finditer(
             rf"^static (?:int|ssize_t) {name}\([^;{{}}]*\)\n\{{\n.*?^\}}$",
             source, re.MULTILINE | re.DOTALL))
@@ -106,11 +109,14 @@ def _callback_unit() -> str:
         parts.append(f"#line {line} {json.dumps(str(path))}\n{match.group()}\n")
     parts.append('#line 1 "host_callback_adapter"\n'
                  'ssize_t host_test_case_store(const char *buf, size_t count)\n'
-                 '{ return test_case_store(NULL, NULL, buf, count); }\n')
+                 '{ return test_case_store(NULL, NULL, buf, count); }\n'
+                 'ssize_t host_trace_show(char *buf)\n'
+                 '{ return trace_show(NULL, NULL, buf); }\n')
     return "".join(parts)
 
 
-class KernelUploadParserBaselineTest(unittest.TestCase):
+# Keep related callback regressions on one shared native-build fixture.
+class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-many-public-methods
     build_dir: Path
     binary: Path
     fixtures: Dict[str, Tuple[Path, bytes, int]]
@@ -248,6 +254,111 @@ class KernelUploadParserBaselineTest(unittest.TestCase):
         for record in feeds[:-1]:
             self.assertFalse(record["finished"])
         return feeds
+
+    def trace_records(self, tc_ready: bool, inputs_ready: bool, unfinished: bool,
+                      mode: str) -> Tuple[str, List[Dict[str, Any]]]:
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        result = subprocess.run(
+            [str(self.binary), "trace", str(int(tc_ready)), str(int(inputs_ready)),
+             str(int(unfinished)), mode], capture_output=True, text=True, check=False,
+            timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        self.assertEqual(len(records), 3 if mode == "paginate" else 2)
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"trace_mode": mode, "records": records, "stderr": result.stderr}))
+        return result.stderr, records[:-1]
+
+    def check_rejected_trace(self, record: Dict[str, Any], trace_calls: int) -> None:
+        self.assertEqual(record["ret"], -errno.EIO)
+        self.assertEqual(record["trace_calls"], trace_calls)
+        self.assertTrue(record["buffer_unchanged"])
+        self.assertEqual(record["output_hex"], "")
+        self.assertEqual(record["unfinished_before"], record["unfinished_after"])
+        self.assertEqual(record["next_before"], record["next_after"])
+        # Real completion predicates are idle/true here: they must not substitute for readiness.
+        self.assertTrue(record["tc_completed"])
+        self.assertTrue(record["inputs_completed"])
+
+    def test_trace_rejects_unready_execution(self) -> None:
+        for tc_ready, inputs_ready in ((False, True), (True, False), (False, False)):
+            for unfinished in (False, True):
+                with self.subTest(tc=tc_ready, inputs=inputs_ready, unfinished=unfinished):
+                    stderr, records = self.trace_records(tc_ready, inputs_ready,
+                                                         unfinished, "execute")
+                    self.check_rejected_trace(records[0], trace_calls=0)
+                    self.assertEqual(records[0]["next_before"], -1)
+                    self.assertEqual(stderr, "[rvzr_executor:trace_show] Assertion failed: "
+                                     "tc_ready && inputs_ready\n")
+
+    def test_trace_rejects_unready_pending_results(self) -> None:
+        for tc_ready, inputs_ready in ((False, True), (True, False), (False, False)):
+            for unfinished in (False, True):
+                with self.subTest(tc=tc_ready, inputs=inputs_ready, unfinished=unfinished):
+                    stderr, records = self.trace_records(tc_ready, inputs_ready,
+                                                         unfinished, "pending")
+                    self.check_rejected_trace(records[0], trace_calls=0)
+                    self.assertEqual(records[0]["next_before"], 1)
+                    self.assertEqual(stderr, "[rvzr_executor:trace_show] Assertion failed: "
+                                     "tc_ready && inputs_ready\n")
+
+    def test_trace_ready_executes_and_formats_results(self) -> None:
+        stderr, records = self.trace_records(True, True, False, "execute")
+        self.assertEqual(stderr, "")
+        record = records[0]
+        self.assertEqual(record["trace_calls"], 1)
+        self.assertEqual(record["next_before"], -1)
+        self.assertEqual(record["next_after"], -1)
+        self.assertFalse(record["unfinished_after"])
+        expected = b"2,2,2,2,2,2\n1,1,1,1,1,1\ndone\n"
+        self.assertEqual(bytes.fromhex(record["output_hex"]), expected)
+        self.assertEqual(record["ret"], len(expected))
+
+    def test_trace_ready_pending_results_do_not_remeasure(self) -> None:
+        stderr, records = self.trace_records(True, True, False, "pending")
+        self.assertEqual(stderr, "")
+        record = records[0]
+        self.assertEqual(record["trace_calls"], 0)
+        self.assertEqual(record["next_before"], 1)
+        self.assertEqual(record["next_after"], -1)
+        expected = b"2,2,2,2,2,2\n1,1,1,1,1,1\ndone\n"
+        self.assertEqual(bytes.fromhex(record["output_hex"]), expected)
+        self.assertEqual(record["ret"], len(expected))
+
+    def test_trace_ready_pagination_preserves_format_and_cursor(self) -> None:
+        stderr, records = self.trace_records(True, True, False, "paginate")
+        self.assertEqual(stderr, "")
+        first, second = records
+        self.assertEqual(first["trace_calls"], 1)
+        self.assertEqual(first["ret"], 4032)
+        self.assertEqual(first["next_after"], 31)
+        self.assertEqual(second["next_before"], 31)
+        self.assertEqual(second["next_after"], -1)
+        self.assertEqual(second["trace_calls"], 1)
+        expected = b"".join((",".join([str((1 << 64) - 1 - index)] * 6) + "\n").encode()
+                            for index in reversed(range(64))) + b"done\n"
+        output = b"".join(bytes.fromhex(record["output_hex"]) for record in records)
+        self.assertEqual(output, expected)
+        self.assertEqual(sum(record["ret"] for record in records), len(expected))
+
+    def test_trace_invalidated_pagination_does_not_emit_or_advance(self) -> None:
+        for tc_ready, inputs_ready in ((False, True), (True, False), (False, False)):
+            with self.subTest(tc=tc_ready, inputs=inputs_ready):
+                stderr, records = self.trace_records(tc_ready, inputs_ready, False, "paginate")
+                first, second = records
+                self.assertEqual(first["trace_calls"], 1)
+                self.assertEqual(first["ret"], 4032)
+                self.assertEqual(first["next_after"], 31)
+                self.assertTrue(first["tc_ready"])
+                self.assertTrue(first["inputs_ready"])
+                self.check_rejected_trace(second, trace_calls=1)
+                self.assertEqual(second["next_before"], 31)
+                self.assertEqual(second["tc_ready"], tc_ready)
+                self.assertEqual(second["inputs_ready"], inputs_ready)
+                self.assertEqual(stderr, "[rvzr_executor:trace_show] Assertion failed: "
+                                 "tc_ready && inputs_ready\n")
 
     def test_store_complete_rcbf(self) -> None:
         feeds = self.run_fixture("rcbf", True, route="store")

@@ -25,11 +25,17 @@ static bool ready_before_call, ready_at_parser_entry;
 
 /* Storage for the actual callback's globals, with the production initial values. */
 bool tc_ready = false;
+bool inputs_ready = false;
+bool unfinished_call = false;
 int next_measurement_id = -1;
+measurement_t *measurements;
+static measurement_t owned_measurements[64];
+static size_t trace_calls;
 
 uint64_t host_tc_cursor(void);
 uint64_t host_input_cursor(void);
 ssize_t host_test_case_store(const char *buf, size_t count);
+ssize_t host_trace_show(char *buf);
 ssize_t __real_parse_test_case_buffer(const char *buf, size_t count, bool *finished);
 
 /* GNU ld wrapping observes the real parser without changing its return or flag. */
@@ -236,8 +242,90 @@ static size_t read_fixture(const char *path, char *data)
     return length;
 }
 
+static void seed_measurements(void)
+{
+    if (n_inputs > 64) fatal("measurement fixture bound exceeded");
+    for (size_t i = 0; i < n_inputs; i++) {
+        /* Twenty-digit values force pagination; small fixtures have readable results. */
+        uint64_t value = n_inputs == 64 ? ~0ULL - i : i + 1;
+        owned_measurements[i].htrace[0] = value;
+        for (size_t j = 0; j < NUM_PFC; j++)
+            owned_measurements[i].pfc_reading[j] = value;
+    }
+}
+
+/* Success stub only. Admission must be enforced by the real trace_show(), not here. */
+int trace_test_case(void)
+{
+    trace_calls++;
+    seed_measurements();
+    return 0;
+}
+
+static void observe_trace(size_t page)
+{
+    char buffer[PAGE_SIZE], before[PAGE_SIZE];
+    memset(buffer, 0xA5, sizeof(buffer));
+    memcpy(before, buffer, sizeof(buffer));
+    int previous_id = next_measurement_id;
+    bool previous_unfinished = unfinished_call;
+    ssize_t ret = host_trace_show(buffer);
+    if (ret >= (ssize_t)sizeof(buffer)) fatal("trace output exceeds owned buffer");
+    printf("{\"event\":\"trace\",\"page\":%zu,\"ret\":%zd,\"trace_calls\":%zu,"
+           "\"tc_ready\":%s,\"inputs_ready\":%s,\"unfinished_before\":%s,"
+           "\"unfinished_after\":%s,\"next_before\":%d,\"next_after\":%d,"
+           "\"buffer_unchanged\":%s,\"tc_completed\":%s,\"inputs_completed\":%s,"
+           "\"output_hex\":\"",
+           page, ret, trace_calls, tc_ready ? "true" : "false",
+           inputs_ready ? "true" : "false", previous_unfinished ? "true" : "false",
+           unfinished_call ? "true" : "false", previous_id, next_measurement_id,
+           memcmp(buffer, before, sizeof(buffer)) == 0 ? "true" : "false",
+           tc_parsing_completed() ? "true" : "false",
+           input_parsing_completed() ? "true" : "false");
+    /* Negative returns expose no buffer contents, even if a defective callback wrote them. */
+    for (ssize_t i = 0; i < ret; i++) printf("%02x", (unsigned char)buffer[i]);
+    puts("\"}");
+    fflush(stdout);
+}
+
+static bool boolean_argument(const char *text)
+{
+    if (strcmp(text, "0") && strcmp(text, "1")) fatal("expected 0 or 1");
+    return !strcmp(text, "1");
+}
+
+static int trace_scenario(int argc, char **argv)
+{
+    if (argc != 6 || (strcmp(argv[5], "execute") && strcmp(argv[5], "pending") &&
+                      strcmp(argv[5], "paginate")))
+        fatal("usage: harness trace TC_READY INPUTS_READY UNFINISHED execute|pending|paginate");
+    bool selected_tc = boolean_argument(argv[2]);
+    bool selected_inputs = boolean_argument(argv[3]);
+    unfinished_call = boolean_argument(argv[4]);
+    bool paginate = !strcmp(argv[5], "paginate");
+    if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
+    tc_ready = paginate ? true : selected_tc;
+    inputs_ready = paginate ? true : selected_inputs;
+    n_inputs = paginate ? 64 : 2;
+    measurements = owned_measurements;
+    seed_measurements();
+    next_measurement_id = !strcmp(argv[5], "pending") ? 1 : -1;
+    observe_trace(0);
+    if (paginate) {
+        /* Explicit synthetic invalidation between real callback calls, not an upload model. */
+        tc_ready = selected_tc;
+        inputs_ready = selected_inputs;
+        observe_trace(1);
+    }
+    free_input_parser();
+    free_test_case_parser();
+    printf("{\"event\":\"teardown\",\"live_bytes\":%zu}\n", live_bytes);
+    return live_bytes ? 66 : 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
     if ((argc != 6 && argc != 7) || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
         (strcmp(argv[2], "direct") && strcmp(argv[2], "store")))
         fatal("usage: harness rcbf|rdbf direct|store FIXTURE PREFIX_BYTES STEP_BYTES [REPLACEMENT]");

@@ -1,8 +1,9 @@
 # Host upload-parser baseline
 
 This runs the repository's production `test_case_parser.c` and `input_parser.c` as host C code.
-It also compiles the exact `test_case_store()` and `check_test_case_compat()`
-definitions extracted from `main.c`, with counted success stubs for preparation.
+It also compiles the exact `test_case_store()`, `check_test_case_compat()` and
+`trace_show()` definitions extracted from `main.c`, with counted success stubs
+for preparation and measurement.
 It does not load a module, execute test-case instructions, access sysfs or model
 kernel concurrency. Readiness publication, generations and failure injection
 are outside this stage.
@@ -281,9 +282,9 @@ compilation was unavailable locally: this WSL2 host has no kernel build tree or
 ARM64 kernel development tree/cross-compiler. Compiling the extracted production
 callback as host C is not a substitute for the existing native ARM64 module checks.
 
-### Deliberately limited guarantee
+### Deliberately limited guarantee at B3.3c.1
 
-`main.c:trace_show()` checks `measurements`, `input_parsing_completed()` and
+Before B3.3c.2, `main.c:trace_show()` checks `measurements`, `input_parsing_completed()` and
 `tc_parsing_completed()`, but does **not** check `tc_ready` or `inputs_ready`.
 The parser clears receiving before final semantic validation, so completion can
 be true after validation failure. `measurement.c:pre_run()` checks entry and input
@@ -303,3 +304,97 @@ input validity need separate coverage. Eventual generation-checked execution mus
 bind test case, inputs, allocations and result iteration to the same completed
 preparation, and check/execute under appropriate synchronization. A read-only flag
 or descriptor alone cannot provide this guarantee. No such protocol is added here.
+
+## B3.3c.2 sequential trace admission
+
+The sole production change is `ASSERT(tc_ready && inputs_ready, "trace_show")`
+before the existing pointer/completion checks in `main.c:trace_show()`. The real
+`ASSERT` macro returns `-EIO`, consistent with the existing trace-interface
+assertions, and logs the failed condition. Local integer initialization is the
+only preceding work: no experiment, result formatting, cursor update or write to
+`unfinished_call` has occurred. Both new measurement and pending-result paths
+pass this guard. A rejection preserves even an already true `unfinished_call`;
+it neither repairs existing execution-error state nor discards stored results.
+
+The extractor now includes the actual `trace_show()` body and a thin adapter.
+Its only new dependencies are existing production headers and host storage for
+`inputs_ready`, `unfinished_call` and `measurements`. It uses **real libc
+`sprintf`**, not a replacement formatter, to write into an exact 4096-byte owned
+buffer. The entire buffer starts with a sentinel pattern; rejection must leave
+all bytes unchanged. Returned output is reported as hex, independently checked
+against expected ASCII bytes by Python. A counted `trace_test_case()` stub always
+succeeds and seeds at most 64 owned `measurement_t` records. It deliberately
+does not enforce readiness itself, so it cannot hide callback admission defects.
+
+This is a separate bounded harness mode, not a simulated preparation protocol:
+
+```text
+parser-baseline trace TC_READY INPUTS_READY UNFINISHED execute|pending|paginate
+```
+
+The flags are explicit synthetic fixture state. Actual parser completion
+predicates are idle/true in these tests; no successful preparation is implied.
+`execute` starts with cursor -1 and two measurements; `pending` starts with cursor
+1 and preloaded results. `paginate` first permits a real callback invocation with
+64 records, then applies the selected flags before calling it again. There is
+no test-case execution, kernel access or new compatibility emulation. Each
+scenario runs in its own process with the existing five-second timeout and
+requires zero tracked parser bytes at teardown.
+
+Six additional test methods cover:
+
+- All three unready flag combinations for execution and pending results, each
+  with `unfinished_call` initially false and true (12 independent subcases).
+- Both flags true: one measurement-stub call and the exact descending result
+  format, plus `done\n`.
+- Ready pending results: the same output without another measurement-stub call.
+- Successful two-page output: 64 twenty-digit synthetic measurements produce
+  a 4032-byte first page (cursor 31) and a 4037-byte final page (cursor -1).
+  Concatenated bytes must exactly match the independent expected output.
+- Invalidation after the first page, for all three unready combinations: return
+  -EIO, no output write, unchanged cursor 31 and no additional stub call.
+
+All 15 rejection subcases failed against the original callback before the guard
+was applied. Old execution reached the stub; invalidated pagination returned
+4037 bytes instead of -EIO. This is evidence from the compiled production
+callback with synthetic resources, not a source-only prediction. The existing
+upload/parser regressions and earlier historical defect evidence are retained.
+
+On x86-64 WSL2/GCC 13.3.0, all 18 test methods passed ordinarily and in each
+separate ASan and UBSan build, with no sanitizer findings. The existing
+LeakSanitizer limitation remains. All 102 input-format, descriptor, preparation,
+coverage and resource-lifetime regressions also passed. Full module compilation
+was unavailable locally because kernel development trees and an ARM64 compiler
+are absent; the existing native ARM64 build configuration was not changed or run.
+
+### Input readiness and remaining identity limits
+
+Source inspection of `main.c:test_case_store()` shows it never clears
+`inputs_ready`. A successful replacement can therefore make both flags true
+while the input batch still belongs to the preceding test case. The new guard
+cannot detect that association or an actor-count mismatch introduced by later
+test-case replacement. Actual batch reuse needs an explicit validity policy.
+
+`main.c:inputs_store()` clears `inputs_ready` **after** calling the parser and
+sets it true solely from `finished`, without an explicit negative-return guard.
+In the current `input_parser.c:parse_input_buffer()`, negative returns occur on
+batch-start failure and return before setting `finished`; the callback initializes
+that flag false. Unlike RCBF's final validator, no negative-return/finished-true
+input path has been demonstrated here. Thus a returned ordinary parser error
+clears input readiness in the current sequential path. The missing explicit
+error check is a defensive gap, not a newly confirmed reproduction of the RCBF
+bug. Completion also performs no final semantic validation of uploaded metadata.
+The input callback itself is not compiled/exercised by this stage's tests.
+
+During input parsing, the old input-readiness value remains visible until the
+parser returns. Both callbacks and trace entry still share globals without an
+executor-wide lock. The guard establishes **sequential Boolean admission only**;
+it cannot make readiness checks atomic with execution or verify generation
+identity. Pending results are blocked while a flag is false but are not erased
+or tagged, so later flag restoration alone cannot establish their provenance.
+
+Next steps remain separate: establish input invalidation on test-case replacement
+and robust input-error publication, characterize preparation failures/cleanup,
+then bind test case, inputs, allocations and result pagination to a common
+generation under synchronization. Host-stub results do not establish loaded-
+kernel or M3 compatibility. CI, serialization and 16 KB execution are unchanged.
