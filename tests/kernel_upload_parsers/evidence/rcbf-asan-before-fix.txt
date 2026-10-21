@@ -1,0 +1,82 @@
+test_complete_rdbf (tests.unit_kernel_upload_parsers.KernelUploadParserBaselineTest.test_complete_rdbf) ... ok
+test_complete_rcbf (tests.unit_kernel_upload_parsers.KernelUploadParserBaselineTest.test_complete_rcbf) ... FAIL
+
+======================================================================
+FAIL: test_complete_rcbf (tests.unit_kernel_upload_parsers.KernelUploadParserBaselineTest.test_complete_rcbf)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/kaffe/masterThesis/side-channel-fuzzer/tests/unit_kernel_upload_parsers.py", line 178, in test_complete_rcbf
+    feeds = self.run_fixture("rcbf", True)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kaffe/masterThesis/side-channel-fuzzer/tests/unit_kernel_upload_parsers.py", line 147, in run_fixture
+    self.assertEqual(result.returncode, 0,
+AssertionError: 1 != 0 : rcbf complete=True, exit=1
+stdout:
+{"event":"init","requested":0,"ret":0,"finished":false,"not_receiving":true,"receiving":false,"cursor":0,"n_actors":1,"n_inputs":0,"allocation_attempts":8,"live_bytes":16577,"consumed":0,"hash":null}
+{"event":"feed","requested":220,"ret":16,"finished":false,"not_receiving":false,"receiving":true,"cursor":16,"n_actors":1,"n_inputs":0,"allocation_attempts":13,"live_bytes":16673,"consumed":16,"hash":null}
+{"event":"feed","requested":204,"ret":48,"finished":false,"not_receiving":false,"receiving":true,"cursor":64,"n_actors":1,"n_inputs":0,"allocation_attempts":13,"live_bytes":16673,"consumed":48,"hash":null}
+{"event":"feed","requested":156,"ret":96,"finished":false,"not_receiving":false,"receiving":true,"cursor":160,"n_actors":1,"n_inputs":0,"allocation_attempts":13,"live_bytes":16673,"consumed":96,"hash":null}
+{"event":"feed","requested":60,"ret":24,"finished":false,"not_receiving":false,"receiving":true,"cursor":184,"n_actors":1,"n_inputs":0,"allocation_attempts":13,"live_bytes":16673,"consumed":24,"hash":null}
+
+stderr:
+=================================================================
+==40==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x5030000000c0 at pc 0x0000004048a9 bp 0x7ffc1de95fd0 sp 0x7ffc1de95fc0
+READ of size 8 at 0x5030000000c0 thread T0
+    #0 0x4048a8 in parse_test_case_buffer /home/kaffe/masterThesis/side-channel-fuzzer/rvzr/executor_km/test_case_parser.c:277
+    #1 0x402324 in feed /home/kaffe/masterThesis/side-channel-fuzzer/tests/kernel_upload_parsers/harness.c:131
+    #2 0x402b6e in main /home/kaffe/masterThesis/side-channel-fuzzer/tests/kernel_upload_parsers/harness.c:174
+    #3 0x7fa885ab81c9  (/lib/x86_64-linux-gnu/libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+    #4 0x7fa885ab828a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x2a28a) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+    #5 0x401454 in _start (/tmp/rvzr-parser-baseline-w4xzkc9b/parser-baseline+0x401454) (BuildId: b1fbc358940b160291841d2b1dc010524c11fa4b)
+
+0x5030000000c0 is located 8 bytes after 24-byte region [0x5030000000a0,0x5030000000b8)
+allocated by thread T0 here:
+    #0 0x7fa885d9e9c7 in malloc ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:69
+    #1 0x40165c in host_allocate /home/kaffe/masterThesis/side-channel-fuzzer/tests/kernel_upload_parsers/harness.c:38
+    #2 0x40322f in __batch_tc_parsing_start /home/kaffe/masterThesis/side-channel-fuzzer/rvzr/executor_km/test_case_parser.c:79
+    #3 0x4040fe in parse_test_case_buffer /home/kaffe/masterThesis/side-channel-fuzzer/rvzr/executor_km/test_case_parser.c:205
+    #4 0x402324 in feed /home/kaffe/masterThesis/side-channel-fuzzer/tests/kernel_upload_parsers/harness.c:131
+    #5 0x402b6e in main /home/kaffe/masterThesis/side-channel-fuzzer/tests/kernel_upload_parsers/harness.c:174
+    #6 0x7fa885ab81c9  (/lib/x86_64-linux-gnu/libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+    #7 0x7fa885ab828a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x2a28a) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+    #8 0x401454 in _start (/tmp/rvzr-parser-baseline-w4xzkc9b/parser-baseline+0x401454) (BuildId: b1fbc358940b160291841d2b1dc010524c11fa4b)
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /home/kaffe/masterThesis/side-channel-fuzzer/rvzr/executor_km/test_case_parser.c:277 in parse_test_case_buffer
+Shadow bytes around the buggy address:
+  0x502ffffffe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x502ffffffe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x502fffffff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x502fffffff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x503000000000: fa fa 00 00 00 fa fa fa fd fd fd fa fa fa 00 00
+=>0x503000000080: 00 00 fa fa 00 00 00 fa[fa]fa fa fa fa fa fa fa
+  0x503000000100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x503000000180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x503000000200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x503000000280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x503000000300: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==40==ABORTING
+
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.279s
+
+FAILED (failures=1)

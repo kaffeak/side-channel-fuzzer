@@ -274,7 +274,9 @@ ssize_t parse_test_case_buffer(const char *buf, size_t count, bool *finished)
         if (func_finished) {
             curr_section_id++;
             curr_section_start = curr_section_end;
-            curr_section_end = curr_section_end + test_case->metadata[curr_section_id].size;
+            // Only a non-final section has a next metadata entry to read.
+            if (curr_section_id < n_actors)
+                curr_section_end = curr_section_end + test_case->metadata[curr_section_id].size;
         }
     }
 

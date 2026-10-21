@@ -151,6 +151,21 @@ jobs:
             tests.unit_model_resource_lifetime \
             -v
 
+      - name: Verify ARM64 kernel upload parsers
+        run: |
+          python -m unittest tests.unit_kernel_upload_parsers -v
+
+
+      - name: Verify ARM64 upload parsers with AddressSanitizer
+        run: |
+          RVZR_PARSER_SANITIZER=address \
+            python -m unittest -f tests.unit_kernel_upload_parsers -v
+
+      - name: Verify ARM64 upload parsers with UndefinedBehaviorSanitizer
+        run: |
+          RVZR_PARSER_SANITIZER=undefined \
+            python -m unittest -f tests.unit_kernel_upload_parsers -v
+
 
       - name: Characterize cache observation semantics
         run: |
