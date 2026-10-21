@@ -14,17 +14,25 @@ the small owned binary; these are not native M3 measurements.
 python -m unittest tests.unit_model_coverage_lifecycle tests.unit_model_resource_lifetime -v
 ```
 
-The 12 coverage tests use the actual `InstructionCoverage` implementation and
+The 22 coverage tests use the actual `InstructionCoverage` implementation and
 real prepared models where useful. They establish instruction-shape signatures,
 address independence for a controlled fixture, aggregation of actor-sourced
 instructions, per-input/per-load accumulation, instrumentation exclusion and
-disabled coverage. The actor aggregation test submits real per-actor instruction
-objects to coverage; the fixture itself executes only its main actor.
+disabled coverage. They also verify exactly-once signature contributions per load
+interval, non-mutating reports including pending observations, and independent
+normal/architectural model coverage. The actor aggregation test submits real
+per-actor instruction objects to coverage; the fixture itself executes only main.
+
+Local counters count instruction executions across all inputs within an interval.
+Campaign counters count signature presence per interval, not executions. A new
+model load finishes the previous interval and starts another, even when reloading
+the same test case. Explicit finalization does not start a new interval: subsequent
+observations can contribute newly seen signatures, but previously committed ones
+are not counted again. Reports combine history and pending signatures in a
+temporary view without committing anything, including when writing fails.
 
 Tests named `legacy_risk` deliberately characterize behavior requiring review:
 
-- Repeated finalization counts the same pending interval again.
-- Reporting finalizes again and therefore changes counts on repeated requests.
 - Operand mutation leaves the cached signature stale.
 - Cache ID/string metadata remains after the instruction is collected.
 
@@ -109,10 +117,10 @@ Compare repeated fresh-process runs, warm-up/batch trends and weakref observatio
 use native allocation instrumentation if unexplained persistent growth remains.
 `tracemalloc` by itself cannot establish native allocation release.
 
-The current evidence should guide later, separate changes to exactly-once coverage
-finalization and lifetime-safe signature caching, followed by data-only coverage
-preservation. It does not justify manually closing engines, prove kernel allocation
-lifetime, enable 16 KB execution, or validate Apple M3 Pro compatibility.
+Exactly-once finalization and non-mutating reports are now regression-tested.
+Lifetime-safe signature caching remains separate work before data-only coverage
+preservation. This evidence does not justify manually closing engines, prove
+kernel allocation lifetime, enable 16 KB execution, or validate Apple M3 Pro compatibility.
 
 Lint/type-check the new Python files with the repository's tools. Because `tools`
 is a namespace package, pass `--explicit-package-bases` when checking its source

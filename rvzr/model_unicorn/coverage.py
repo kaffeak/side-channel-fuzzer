@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT
 from __future__ import annotations
 from collections import defaultdict
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from typing_extensions import assert_never
 
 from ..tc_components.instruction import Instruction, RegisterOp, MemoryOp, \
@@ -58,20 +58,26 @@ class InstructionCoverage:
     Tracks coverage of instructions executed on the model during a fuzzing campaign.
     """
     _cov: Dict[str, int]
-    """ instruction coverage of the entire campaign """
+    """ Number of committed test-case intervals containing each instruction signature. """
 
     _local_cov: Optional[Dict[str, int]] = None
-    """ instruction coverage of the current test case """
+    """ Execution counts within the current test-case load interval; None when disabled. """
+
+    _finalized_signatures: Set[str]
+    """ Signatures already committed from the current interval, cleared on the next start. """
 
     def __init__(self) -> None:
         self._cov = defaultdict(int)
+        self._finalized_signatures = set()
 
     def start_test_case(self) -> None:
         """
         Start tracking coverage for a new test case when CONF.coverage_type == "model_instructions".
         Otherwise, disable coverage tracking.
+        The caller must finish the preceding interval before starting another.
         """
 
+        self._finalized_signatures.clear()
         if CONF.coverage_type == "model_instructions":
             self._local_cov = defaultdict(int)
             return
@@ -87,20 +93,31 @@ class InstructionCoverage:
         self._local_cov[_get_instruction_signature(inst)] += 1
 
     def finish_test_case(self) -> None:
-        """ Finish tracking coverage for the current test case """
+        """ Commit each observed signature at most once per test-case load interval.
+
+        Further observations before the next start remain in the same interval:
+        only previously uncommitted signatures can contribute on a later finish.
+        """
         if self._local_cov is None:
             return
 
-        for inst_name in self._local_cov.keys():
+        for inst_name in self._local_cov:
+            if inst_name in self._finalized_signatures:
+                continue
             self._cov[inst_name] += 1
+            self._finalized_signatures.add(inst_name)
 
     def report(self, path: str) -> None:
-        """ Write the coverage data to a file """
-        # Ensure that the last test case is included in the coverage report
-        self.finish_test_case()
+        """ Write committed history plus pending signature presence without changing state. """
+        counts = self._cov.copy()
+        if self._local_cov is not None:
+            for inst_name in self._local_cov:
+                if inst_name in self._finalized_signatures:
+                    continue
+                counts[inst_name] = counts.get(inst_name, 0) + 1
 
         # Sort the instructions by coverage count and write them to the file
-        inst_names = sorted(self._cov.items(), key=lambda x: x[1], reverse=True)
+        inst_names = sorted(counts.items(), key=lambda x: x[1], reverse=True)
         with open(path, "w") as f:
             for inst_name, count in inst_names:
                 f.write(f"{inst_name:<20} {count}\n")
