@@ -1,9 +1,11 @@
-/* Compile real parsers in separate TUs; direct-parser baseline only.
+/* Compile real parsers and an extracted production callback in separate TUs.
  * Only owned host buffers are used; no kernel, PMU or test-case code executes.
  */
 #include "compat.h"
 #include "test_case_parser.h"
 #include "input_parser.h"
+#include "sandbox_manager.h"
+#include "code_loader.h"
 #include "shortcuts.h"
 
 _Static_assert(sizeof(void *) == 8 && sizeof(uint64_t) == 8, "64-bit host required");
@@ -15,11 +17,43 @@ _Static_assert(sizeof(void *) == 8 && sizeof(uint64_t) == 8, "64-bit host requir
 
 static struct { void *pointer; size_t size; } blocks[MAX_BLOCKS];
 static size_t live_bytes, total_attempts, calls;
-static bool use_inputs, last_finished;
+static bool use_inputs, use_store, last_finished;
 static ssize_t last_parser_ret;
+static size_t sandbox_calls, code_calls, parser_calls;
+static size_t upload_id;
+static bool ready_before_call, ready_at_parser_entry;
+
+/* Storage for the actual callback's globals, with the production initial values. */
+bool tc_ready = false;
+int next_measurement_id = -1;
 
 uint64_t host_tc_cursor(void);
 uint64_t host_input_cursor(void);
+ssize_t host_test_case_store(const char *buf, size_t count);
+ssize_t __real_parse_test_case_buffer(const char *buf, size_t count, bool *finished);
+
+/* GNU ld wrapping observes the real parser without changing its return or flag. */
+ssize_t __wrap_parse_test_case_buffer(const char *buf, size_t count, bool *finished)
+{
+    parser_calls++;
+    ready_at_parser_entry = tc_ready;
+    last_parser_ret = __real_parse_test_case_buffer(buf, count, finished);
+    last_finished = *finished;
+    return last_parser_ret;
+}
+
+/* Counted success stubs only: no sandbox allocation or test-case code loading. */
+int allocate_sandbox(void)
+{
+    sandbox_calls++;
+    return 0;
+}
+
+int load_sandbox_code(void)
+{
+    code_calls++;
+    return 0;
+}
 
 static void fatal(const char *message)
 {
@@ -81,8 +115,6 @@ static bool tracked(void *pointer, size_t minimum)
     return tracked_range(pointer, 0, minimum);
 }
 
-/* No sysfs callbacks, callback extraction, linker wrapping or failure injection. */
-
 static uint64_t hash_bytes(uint64_t hash, const void *pointer, size_t size)
 {
     const unsigned char *bytes = pointer;
@@ -105,6 +137,19 @@ static void emit(const char *event, size_t requested, ssize_t ret)
            completed ? "true" : "false", completed ? "false" : "true", cursor_,
            n_actors, n_inputs, total_attempts, live_bytes);
     if (ret >= 0) printf("%zd", ret); else printf("null");
+    printf(",\"parser_ret\":");
+    if (parser_calls) printf("%zd", last_parser_ret); else printf("null");
+    printf(",\"parser_calls\":%zu,\"callback_ret\":", parser_calls);
+    if (use_store && !strcmp(event, "feed")) printf("%zd", ret); else printf("null");
+    printf(",\"tc_ready\":%s,\"sandbox_calls\":%zu,\"code_calls\":%zu,"
+           "\"next_measurement_id\":%d,\"upload_id\":%zu,\"ready_before_call\":%s,"
+           "\"ready_at_parser_entry\":",
+           tc_ready ? "true" : "false", sandbox_calls, code_calls, next_measurement_id,
+           upload_id, ready_before_call ? "true" : "false");
+    if (use_store && parser_calls)
+        printf("%s", ready_at_parser_entry ? "true" : "false");
+    else
+        printf("null");
     printf(",\"metadata_allocation_bytes\":");
     if (!use_inputs && tracked(test_case, sizeof(*test_case)))
         printf("%zu", allocation_size(test_case->metadata));
@@ -149,10 +194,21 @@ static ssize_t feed(const char *source, size_t count)
     memcpy(buffer, source, count);
     buffer[count] = '\0';
     bool finished = false;
-    ssize_t ret = use_inputs ? parse_input_buffer(buffer, count, &finished)
-                            : parse_test_case_buffer(buffer, count, &finished);
-    last_parser_ret = ret;
-    last_finished = finished;
+    ssize_t ret;
+    if (use_store) {
+        size_t previous_calls = parser_calls;
+        ready_before_call = tc_ready;
+        ret = host_test_case_store(buffer, count);
+        if (parser_calls != previous_calls + 1)
+            fatal("callback did not call the observed production parser exactly once");
+    } else if (use_inputs) {
+        parser_calls++;
+        ret = parse_input_buffer(buffer, count, &finished);
+        last_parser_ret = ret;
+        last_finished = finished;
+    } else {
+        ret = parse_test_case_buffer(buffer, count, &finished);
+    }
     emit("feed", count, ret);
     free(buffer);
     return ret;
@@ -170,33 +226,50 @@ static size_t bounded_number(const char *text, size_t maximum)
     return (size_t)value;
 }
 
-int main(int argc, char **argv)
+static size_t read_fixture(const char *path, char *data)
 {
-    if (argc != 6 || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
-        strcmp(argv[2], "direct"))
-        fatal("usage: harness rcbf|rdbf direct FIXTURE PREFIX_BYTES STEP_BYTES");
-    use_inputs = !strcmp(argv[1], "rdbf");
-    char data[MAX_FILE];
-    FILE *file = fopen(argv[3], "rb");
+    FILE *file = fopen(path, "rb");
     if (!file) fatal("cannot open owned fixture");
-    size_t length = fread(data, 1, sizeof(data), file);
+    size_t length = fread(data, 1, MAX_FILE, file);
     if (ferror(file) || fgetc(file) != EOF) fatal("fixture bound exceeded/read failure");
     fclose(file);
+    return length;
+}
+
+int main(int argc, char **argv)
+{
+    if ((argc != 6 && argc != 7) || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
+        (strcmp(argv[2], "direct") && strcmp(argv[2], "store")))
+        fatal("usage: harness rcbf|rdbf direct|store FIXTURE PREFIX_BYTES STEP_BYTES [REPLACEMENT]");
+    use_inputs = !strcmp(argv[1], "rdbf");
+    use_store = !strcmp(argv[2], "store");
+    if (use_inputs && use_store) fatal("only the RCBF test_case_store callback is supported");
+    char data[MAX_FILE];
+    size_t length = read_fixture(argv[3], data);
     size_t count = bounded_number(argv[4], length);
     size_t step = bounded_number(argv[5], PAGE_SIZE);
     if (count < 16 || step < 16) fatal("baseline requires a complete 16-byte header");
+    if (argc == 7 && (!use_store || count != length))
+        fatal("replacement requires store mode and a complete initial upload");
     int err = init_test_case_parser();
     if (!err) err = init_input_parser();
     if (err) fatal("unexpected parser initialization failure");
     emit("init", 0, 0);
-    size_t offset = 0;
     int status = 0;
-    while (count) {
-        size_t requested = count < step ? count : step;
-        ssize_t ret = feed(data + offset, requested);
-        if (ret <= 0 || (size_t)ret > requested) { status = 65; break; }
-        offset += (size_t)ret;
-        count -= (size_t)ret;
+    for (upload_id = 0; upload_id < (argc == 7 ? 2U : 1U); upload_id++) {
+        if (upload_id == 1) {
+            count = read_fixture(argv[6], data);
+            if (count < 16) fatal("replacement requires a complete 16-byte header");
+        }
+        size_t offset = 0;
+        while (count) {
+            size_t requested = count < step ? count : step;
+            ssize_t ret = feed(data + offset, requested);
+            if (ret <= 0 || (size_t)ret > requested) { status = 65; break; }
+            offset += (size_t)ret;
+            count -= (size_t)ret;
+        }
+        if (status) break;
     }
     free_input_parser();
     free_test_case_parser();

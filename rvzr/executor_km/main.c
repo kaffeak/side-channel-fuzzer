@@ -316,10 +316,13 @@ static ssize_t test_case_store(struct kobject *kobj, struct kobj_attribute *attr
                                size_t count)
 {
     int err = 0;
+    // Invalidate the previous preparation before the parser can modify test-case state.
     tc_ready = false;
 
     bool finished = false;
     ssize_t consumed_bytes = parse_test_case_buffer(buf, count, &finished);
+    if (consumed_bytes < 0)
+        return consumed_bytes;
     if (!finished) {
         return consumed_bytes;
     }
