@@ -144,6 +144,14 @@ jobs:
           python -m unittest tests.unit_model_preparation -v
 
 
+      - name: Characterize model coverage and resource lifetime
+        run: |
+          python -m unittest \
+            tests.unit_model_coverage_lifecycle \
+            tests.unit_model_resource_lifetime \
+            -v
+
+
       - name: Characterize cache observation semantics
         run: |
           python -m unittest tests.unit_cache_observation_semantics -v
