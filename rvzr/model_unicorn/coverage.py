@@ -14,21 +14,13 @@ from ..tc_components.instruction import Instruction, RegisterOp, MemoryOp, \
     ImmediateOp, LabelOp, AgenOp, FlagsOp, CondOp
 from ..config import CONF
 
-_SIGNATURE_CACHE: Dict[int, str] = {}
-
 
 def _get_instruction_signature(instruction: Instruction) -> str:
     """
-    Get a brief string representation of the instruction.
+    Get a brief string representation of the instruction's current shape.
     Used as a unique identifier for the instruction when tracking coverage.
+    Compute it on demand: operand lists can change, and object IDs can be reused.
     """
-    inst_identifier = id(instruction)
-
-    # Cache the brief string to avoid recomputing it
-    if inst_identifier in _SIGNATURE_CACHE:
-        return _SIGNATURE_CACHE[inst_identifier]
-
-    # Compute the brief string
     brief = instruction.name
     for o in instruction.operands:
         if isinstance(o, RegisterOp):
@@ -49,7 +41,6 @@ def _get_instruction_signature(instruction: Instruction) -> str:
         else:
             assert_never(o)
 
-    _SIGNATURE_CACHE[inst_identifier] = brief
     return brief
 
 

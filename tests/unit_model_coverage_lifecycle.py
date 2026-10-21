@@ -1,8 +1,7 @@
-"""Coverage finalization/reporting regressions and signature-cache characterization.
+"""Coverage finalization/reporting and current instruction-shape regressions.
 
-Tests named legacy_risk still characterize stale signature caching. Change those
-expectations when caching is fixed. No nondeterministic object-ID reuse is forced.
-The signature cache is isolated per test and restored afterward.
+Signatures are computed without an object-ID cache. Mutation and collection
+checks do not depend on nondeterministically reusing a Python object ID.
 """
 
 # pylint: disable=missing-class-docstring,missing-function-docstring,protected-access
@@ -36,14 +35,12 @@ class ModelCoverageLifecycleTest(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(synthetic_environment(coverage="model_instructions"))
-        stack.enter_context(patch.object(coverage, "_SIGNATURE_CACHE", {}))
         self.directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="rvzr-cov-")))
         self.coverage = coverage.InstructionCoverage()
         self.coverage.start_test_case()
 
     def assert_report(self, expected: Dict[str, int]) -> None:
         state = deepcopy(vars(self.coverage))
-        cache = dict(coverage._SIGNATURE_CACHE)
         campaign, local = self.coverage._cov, self.coverage._local_cov
         finalized = self.coverage._finalized_signatures
         report = self.directory / "coverage.txt"
@@ -52,7 +49,6 @@ class ModelCoverageLifecycleTest(unittest.TestCase):
         self.assertIs(self.coverage._cov, campaign)
         self.assertIs(self.coverage._local_cov, local)
         self.assertIs(self.coverage._finalized_signatures, finalized)
-        self.assertEqual(coverage._SIGNATURE_CACHE, cache)
         lines = report.read_text(encoding="utf-8").splitlines()
         if not expected:
             self.assertEqual(lines, ["    No coverage data available"])
@@ -139,20 +135,22 @@ class ModelCoverageLifecycleTest(unittest.TestCase):
             observations.append(dict(model._dispatcher.coverage._local_cov or {}))
         self.assertEqual(observations, [{"mov R64 R64": 1, "ldr R64 M64": 1}] * 2)
 
-    def test_instrumentation_is_excluded_without_populating_signature_cache(self) -> None:
+    def test_instrumentation_is_excluded_without_computing_signatures(self) -> None:
         inst = Instruction("nop", is_instrumentation=True)
-        self.coverage.add_instruction(inst)
+        with patch.object(coverage, "_get_instruction_signature",
+                          side_effect=AssertionError("Instrumentation signature requested")):
+            self.coverage.add_instruction(inst)
         self.assertEqual(self.coverage._local_cov, {})
-        self.assertEqual(coverage._SIGNATURE_CACHE, {})
 
-    def test_disabled_coverage_does_not_record_or_cache_instructions(self) -> None:
-        with synthetic_environment(coverage="none"):
+    def test_disabled_coverage_does_not_record_or_compute_signatures(self) -> None:
+        with synthetic_environment(coverage="none"), \
+                patch.object(coverage, "_get_instruction_signature",
+                             side_effect=AssertionError("Disabled signature requested")):
             self.coverage.start_test_case()
             self.coverage.add_instruction(Instruction("nop"))
             self.coverage.finish_test_case()
         self.assertIsNone(self.coverage._local_cov)
         self.assertEqual(self.coverage._cov, {})
-        self.assertEqual(coverage._SIGNATURE_CACHE, {})
 
     def test_repeated_finish_commits_the_same_interval_only_once(self) -> None:
         self.coverage.add_instruction(Instruction("nop"))
@@ -302,27 +300,66 @@ class ModelCoverageLifecycleTest(unittest.TestCase):
         self.assertEqual(other._cov, expected)
         self.assert_report(expected)
 
-    def test_legacy_risk_operand_mutation_does_not_invalidate_cached_signature(self) -> None:
+    def test_signature_reflects_appended_operands(self) -> None:
         inst = Instruction("shape")
         inst.add_op(RegisterOp("x0", 64, False, True))
         self.assertEqual(coverage._get_instruction_signature(inst), "shape R64")
         inst.add_op(MemoryOp("x20", 64, True, False))
-        self.assertEqual(coverage._get_instruction_signature(inst), "shape R64")
-        # A new, equivalent instruction demonstrates the expected uncached shape.
+        self.assertEqual(coverage._get_instruction_signature(inst), "shape R64 M64")
+        # A new, equivalent instruction has the same current shape.
         fresh = Instruction("shape")
         fresh.add_op(RegisterOp("x0", 64, False, True))
         fresh.add_op(MemoryOp("x20", 64, True, False))
         self.assertEqual(coverage._get_instruction_signature(fresh), "shape R64 M64")
 
-    def test_legacy_risk_cache_entry_survives_instruction_collection(self) -> None:
-        inst = Instruction("nop")
-        identifier, reference = id(inst), weakref.ref(inst)
-        coverage._get_instruction_signature(inst)
-        del inst
+    def test_signature_reads_current_mnemonic_on_each_call(self) -> None:
+        inst = Instruction("before").add_op(RegisterOp("x0", 64, False, True))
+        self.assertEqual(coverage._get_instruction_signature(inst), "before R64")
+        # name is Final for typed callers, but Python does not freeze it at runtime.
+        with patch.object(inst, "name", "after"):
+            self.assertEqual(coverage._get_instruction_signature(inst), "after R64")
+        self.assertEqual(coverage._get_instruction_signature(inst), "before R64")
+
+    def test_coverage_reflects_operand_replacement_reordering_and_removal(self) -> None:
+        inst = Instruction("shape")
+        inst.add_op(RegisterOp("x0", 64, False, True))
+        inst.add_op(MemoryOp("x20", 64, True, False))
+        self.coverage.add_instruction(inst)
+        inst.operands[0] = RegisterOp("w0", 32, False, True)
+        inst.operands[1] = MemoryOp("x20", 128, True, False)
+        self.coverage.add_instruction(inst)
+        inst.operands.reverse()
+        self.coverage.add_instruction(inst)
+        inst.operands.pop()
+        self.coverage.add_instruction(inst)
+        inst.operands.clear()
+        self.coverage.add_instruction(inst)
+        expected = {"shape R64 M64": 1, "shape R32 M128": 1, "shape M128 R32": 1,
+                    "shape M128": 1, "shape": 1}
+        self.assertEqual(self.coverage._local_cov, expected)
+        self.assert_report(expected)
+        self.coverage.finish_test_case()
+        self.coverage.finish_test_case()
+        self.assertEqual(self.coverage._cov, expected)
+
+    def test_signature_computation_does_not_retain_discarded_instruction_objects(self) -> None:
+        references = []
+        # Distinct shapes and widths exercise churn without requiring any ID collision.
+        for index in range(128):
+            inst = Instruction(f"shape{index}")
+            inst.add_op(ImmediateOp(str(index), 8 if index % 2 == 0 else 64))
+            expected = f"shape{index} I{8 if index % 2 == 0 else 64}"
+            self.assertEqual(coverage._get_instruction_signature(inst), expected)
+            self.coverage.add_instruction(inst)
+            references.append(weakref.ref(inst))
+            del inst
         gc.collect()
-        self.assertIsNone(reference())
-        self.assertEqual(coverage._SIGNATURE_CACHE, {identifier: "nop"})
-        # This proves retained ID metadata, not actual ID reuse or a model/native leak.
+        self.assertTrue(all(reference() is None for reference in references))
+        self.assertFalse(hasattr(coverage, "_SIGNATURE_CACHE"))
+        self.assertEqual(len(self.coverage._local_cov or {}), 128)
+        self.coverage.finish_test_case()
+        self.assertEqual(len(self.coverage._cov), 128)
+        # Coverage deliberately retains signature strings/counts, not instruction objects.
 
 
 if __name__ == "__main__":
