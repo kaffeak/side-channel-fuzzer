@@ -167,6 +167,21 @@ jobs:
             python -m unittest -f tests.unit_kernel_upload_parsers -v
 
 
+      - name: Verify passive preparation state
+        run: |
+          python -m unittest tests.unit_preparation_state -v
+
+      - name: Verify passive preparation state with AddressSanitizer
+        run: |
+          RVZR_PREPARATION_SANITIZER=address \
+            python -m unittest -f tests.unit_preparation_state -v
+
+      - name: Verify passive preparation state with UndefinedBehaviorSanitizer
+        run: |
+          RVZR_PREPARATION_SANITIZER=undefined \
+            python -m unittest -f tests.unit_preparation_state -v
+
+
       - name: Characterize cache observation semantics
         run: |
           python -m unittest tests.unit_cache_observation_semantics -v
