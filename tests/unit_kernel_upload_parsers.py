@@ -78,8 +78,16 @@ def _fixtures(directory: Path) -> Dict[str, Tuple[Path, bytes, int]]:
     input_.view(np.uint8).reshape(-1)[:] = pattern
     rdbf = directory / "valid.rdbf"
     save_input_sequence_as_rdbf([input_], str(rdbf))
+    paged = directory / "paged.rdbf"
+    save_input_sequence_as_rdbf([input_] * 33, str(paged))
+    wrong_actor = directory / "wrong-actor.rdbf"
+    wrong_input = InputData(2)
+    wrong_input.view(np.uint8).reshape(-1)[:] = 0
+    save_input_sequence_as_rdbf([wrong_input], str(wrong_actor))
     return {"rcbf": _rcbf_fixture(directory, 1), "rcbf_multi": _rcbf_fixture(directory, 3),
             "rcbf_missing_end": _rcbf_fixture(directory, 1, include_end=False),
+            "rdbf_paged": (paged, input_.tobytes() * 33, 405536),
+            "rdbf_wrong_actor": (wrong_actor, wrong_input.tobytes(), 24624),
             "rdbf": (rdbf, input_.tobytes(), 12320)}
 
 
@@ -98,7 +106,7 @@ def _callback_unit() -> str:
              '#include "shortcuts.h"\nstruct kobject;\nstruct kobj_attribute;\n'
              'extern bool tc_ready, inputs_ready, unfinished_call;\n'
              'extern int next_measurement_id;\n']
-    for name in ("check_test_case_compat", "test_case_store", "trace_show"):
+    for name in ("check_test_case_compat", "test_case_store", "inputs_store", "trace_show"):
         matches = list(re.finditer(
             rf"^static (?:int|ssize_t) {name}\([^;{{}}]*\)\n\{{\n.*?^\}}$",
             source, re.MULTILINE | re.DOTALL))
@@ -110,6 +118,8 @@ def _callback_unit() -> str:
     parts.append('#line 1 "host_callback_adapter"\n'
                  'ssize_t host_test_case_store(const char *buf, size_t count)\n'
                  '{ return test_case_store(NULL, NULL, buf, count); }\n'
+                 'ssize_t host_inputs_store(const char *buf, size_t count)\n'
+                 '{ return inputs_store(NULL, NULL, buf, count); }\n'
                  'ssize_t host_trace_show(char *buf)\n'
                  '{ return trace_show(NULL, NULL, buf); }\n')
     return "".join(parts)
@@ -177,7 +187,8 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
                                       + ["-c", source, "-o", str(obj)])
             objects.append(str(obj))
         cls.build_commands.append(compiler + instrumentation + objects
-                                  + ["-Wl,--wrap=parse_test_case_buffer", "-o", str(cls.binary)])
+                                  + ["-Wl,--wrap=parse_test_case_buffer",
+                                     "-Wl,--wrap=parse_input_buffer", "-o", str(cls.binary)])
         for command in cls.build_commands:
             build = subprocess.run(command, capture_output=True, text=True,
                                    check=False, timeout=30)
@@ -271,16 +282,17 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
             print(json.dumps({"trace_mode": mode, "records": records, "stderr": result.stderr}))
         return result.stderr, records[:-1]
 
-    def check_rejected_trace(self, record: Dict[str, Any], trace_calls: int) -> None:
+    def check_rejected_trace(self, record: Dict[str, Any], trace_calls: int,
+                             *, inputs_completed: bool = True) -> None:
         self.assertEqual(record["ret"], -errno.EIO)
         self.assertEqual(record["trace_calls"], trace_calls)
         self.assertTrue(record["buffer_unchanged"])
         self.assertEqual(record["output_hex"], "")
         self.assertEqual(record["unfinished_before"], record["unfinished_after"])
         self.assertEqual(record["next_before"], record["next_after"])
-        # Real completion predicates are idle/true here: they must not substitute for readiness.
+        # Completion predicates are checked separately from validated readiness.
         self.assertTrue(record["tc_completed"])
-        self.assertTrue(record["inputs_completed"])
+        self.assertEqual(record["inputs_completed"], inputs_completed)
 
     def test_trace_rejects_unready_execution(self) -> None:
         for tc_ready, inputs_ready in ((False, True), (True, False), (False, False)):
@@ -359,6 +371,143 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
                 self.assertEqual(second["inputs_ready"], inputs_ready)
                 self.assertEqual(stderr, "[rvzr_executor:trace_show] Assertion failed: "
                                  "tc_ready && inputs_ready\n")
+
+    def preparation_records(self, scenario: str) -> Tuple[str, List[Dict[str, Any]]]:
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        paths = [self.fixtures[key][0] for key in
+                 ("rcbf", "rdbf", "rdbf_paged", "rdbf_wrong_actor")]
+        result = subprocess.run([str(self.binary), "prepare", scenario] + list(map(str, paths)),
+                                capture_output=True, text=True, check=False,
+                                timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(records[0]["event"], "init")
+        self.assertFalse(records[0]["tc_ready"])
+        self.assertFalse(records[0]["inputs_ready"])
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"prepare": scenario, "records": records, "stderr": result.stderr}))
+        return result.stderr, records[1:-1]
+
+    def check_input_upload(self, records: List[Dict[str, Any]], upload_id: int,
+                           returns: List[int]) -> List[Dict[str, Any]]:
+        feeds = [r for r in records if r["event"] == "feed" and r["upload_id"] == upload_id]
+        self.assertTrue(feeds)
+        self.assertEqual([r["ret"] for r in feeds], returns)
+        for record in feeds:
+            self.assertEqual(record["format"], "rdbf")
+            self.assertEqual(record["parser_ret"], record["callback_ret"])
+            self.assertFalse(record["ready_at_parser_entry"])
+            self.assertFalse(record["inputs_at_parser_entry"])
+            self.assertEqual(record["next_at_parser_entry"], -1)
+            self.assertEqual(record["next_measurement_id"], -1)
+            self.assertTrue(record["tc_ready"])
+            self.assertEqual(record["consumed"], record["ret"] if record["ret"] > 0 else None)
+        for record in feeds[:-1]:
+            self.assertFalse(record["finished"])
+            self.assertFalse(record["inputs_ready"])
+        return feeds
+
+    def check_fresh_single_trace(self, record: Dict[str, Any], calls: int) -> None:
+        expected = b"1,1,1,1,1,1\ndone\n"
+        self.assertEqual(record["ret"], len(expected))
+        self.assertEqual(bytes.fromhex(record["output_hex"]), expected)
+        self.assertEqual(record["trace_calls"], calls)
+        self.assertEqual(record["next_before"], -1)
+        self.assertEqual(record["next_after"], -1)
+        self.assertTrue(record["tc_ready"])
+        self.assertTrue(record["inputs_ready"])
+
+    def test_prepare_valid_case_then_inputs_and_trace(self) -> None:
+        stderr, records = self.preparation_records("normal")
+        self.assertEqual(stderr, "")
+        feeds = self.check_input_upload(records, 1, [16, 16, 4096, 4096, 4096])
+        self.assertTrue(feeds[-1]["finished"])
+        self.assertTrue(feeds[-1]["inputs_ready"])
+        self.assertEqual(feeds[-1]["hash"], _hash(self.fixtures["rdbf"][1]))
+        self.check_fresh_single_trace(records[-1], calls=1)
+
+    def test_prepare_replacement_requires_input_reupload(self) -> None:
+        stderr, records = self.preparation_records("test-replacement")
+        self.assertEqual(stderr.count("Assertion failed: tc_ready && inputs_ready"), 1)
+        feeds = [r for r in records if r["event"] == "feed" and r["upload_id"] == 2]
+        self.assertEqual([r["ret"] for r in feeds], [16, 48, 96, 24, 36])
+        self.assertTrue(feeds[-1]["tc_ready"])
+        for record in feeds:
+            self.assertFalse(record["inputs_at_parser_entry"])
+            self.assertFalse(record["inputs_ready"])
+            self.assertEqual(record["next_at_parser_entry"], -1)
+        traces = [r for r in records if r["event"] == "trace"]
+        self.check_rejected_trace(traces[0], trace_calls=0)
+        self.assertEqual(traces[0]["next_before"], -1)
+        self.assertFalse(traces[0]["inputs_ready"])
+        restored = self.check_input_upload(records, 3, [16, 16, 4096, 4096, 4096])
+        self.assertTrue(restored[-1]["inputs_ready"])
+        self.check_fresh_single_trace(traces[1], calls=1)
+
+    def test_prepare_incomplete_inputs_invalidate_pending_results(self) -> None:
+        stderr, records = self.preparation_records("input-incomplete")
+        self.assertIn("Assertion failed: tc_ready && inputs_ready", stderr)
+        first = next(r for r in records if r["event"] == "trace")
+        self.assertEqual(first["ret"], 4032)
+        self.assertEqual(first["next_after"], 0)
+        feeds = self.check_input_upload(records, 2, [16, 16, 4096, 4096, 4088])
+        self.assertTrue(feeds[0]["ready_before_call"])
+        self.assertFalse(feeds[-1]["finished"])
+        self.assertFalse(feeds[-1]["inputs_ready"])
+        self.check_rejected_trace(records[-1], trace_calls=1, inputs_completed=False)
+        self.assertFalse(records[-1]["inputs_completed"])
+
+    def test_prepare_actual_input_header_error_clears_readiness(self) -> None:
+        stderr, records = self.preparation_records("input-error")
+        self.assertIn("Mismatch in n_actors", stderr)
+        self.assertIn("Assertion failed: tc_ready && inputs_ready", stderr)
+        first = next(r for r in records if r["event"] == "trace")
+        self.assertEqual(first["next_after"], 0)
+        feeds = self.check_input_upload(records, 2, [-1])
+        self.assertTrue(feeds[0]["ready_before_call"])
+        self.assertFalse(feeds[0]["finished"])
+        self.assertFalse(feeds[0]["inputs_ready"])
+        self.assertIsNone(feeds[0]["hash"])
+        self.check_rejected_trace(records[-1], trace_calls=1)
+
+    def test_prepare_inputs_require_completed_test_case(self) -> None:
+        stderr, records = self.preparation_records("input-before-test")
+        self.assertIn("Assertion failed: tc_ready", stderr)
+        feed = records[0]
+        self.assertEqual(feed["callback_ret"], -errno.EIO)
+        self.assertEqual(feed["parser_calls"], 0)
+        self.assertIsNone(feed["parser_ret"])
+        self.assertFalse(feed["inputs_ready"])
+        self.assertFalse(feed["tc_ready"])
+        self.check_rejected_trace(records[-1], trace_calls=0)
+
+    def test_prepare_test_upload_discards_real_pending_page(self) -> None:
+        stderr, records = self.preparation_records("test-pending")
+        self.assertIn("Assertion failed: tc_ready && inputs_ready", stderr)
+        traces = [r for r in records if r["event"] == "trace"]
+        self.assertEqual(traces[0]["trace_calls"], 1)
+        self.assertEqual(traces[0]["ret"], 4032)
+        self.assertEqual(traces[0]["next_after"], 0)
+        replacement = [r for r in records if r["event"] == "feed" and r["upload_id"] == 2]
+        self.assertEqual(replacement[0]["ret"], 16)
+        self.assertEqual(replacement[0]["next_at_parser_entry"], -1)
+        self.assertFalse(replacement[0]["inputs_at_parser_entry"])
+        self.check_rejected_trace(traces[1], trace_calls=1)
+        self.assertEqual(traces[1]["next_before"], -1)
+        self.check_fresh_single_trace(traces[2], calls=2)
+
+    def test_prepare_input_upload_discards_real_pending_page(self) -> None:
+        stderr, records = self.preparation_records("input-pending")
+        self.assertEqual(stderr, "")
+        traces = [r for r in records if r["event"] == "trace"]
+        self.assertEqual(traces[0]["ret"], 4032)
+        self.assertEqual(traces[0]["next_after"], 0)
+        feeds = self.check_input_upload(records, 2, [16, 16, 4096, 4096, 4096])
+        self.assertTrue(feeds[0]["ready_before_call"])
+        self.assertTrue(feeds[-1]["inputs_ready"])
+        self.check_fresh_single_trace(traces[1], calls=2)
 
     def test_store_complete_rcbf(self) -> None:
         feeds = self.run_fixture("rcbf", True, route="store")

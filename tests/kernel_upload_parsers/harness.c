@@ -10,7 +10,7 @@
 
 _Static_assert(sizeof(void *) == 8 && sizeof(uint64_t) == 8, "64-bit host required");
 
-#define MAX_FILE (128 * 1024)
+#define MAX_FILE (512 * 1024)
 #define MAX_LIVE (2 * 1024 * 1024)
 #define MAX_BLOCKS 128
 #define MAX_CALLS 4096
@@ -22,6 +22,8 @@ static ssize_t last_parser_ret;
 static size_t sandbox_calls, code_calls, parser_calls;
 static size_t upload_id;
 static bool ready_before_call, ready_at_parser_entry;
+static bool last_parser_called, inputs_at_parser_entry;
+static int next_at_parser_entry;
 
 /* Storage for the actual callback's globals, with the production initial values. */
 bool tc_ready = false;
@@ -35,15 +37,33 @@ static size_t trace_calls;
 uint64_t host_tc_cursor(void);
 uint64_t host_input_cursor(void);
 ssize_t host_test_case_store(const char *buf, size_t count);
+ssize_t host_inputs_store(const char *buf, size_t count);
 ssize_t host_trace_show(char *buf);
 ssize_t __real_parse_test_case_buffer(const char *buf, size_t count, bool *finished);
+ssize_t __real_parse_input_buffer(const char *buf, size_t count, bool *finished);
 
-/* GNU ld wrapping observes the real parser without changing its return or flag. */
-ssize_t __wrap_parse_test_case_buffer(const char *buf, size_t count, bool *finished)
+static void observe_parser_entry(void)
 {
     parser_calls++;
-    ready_at_parser_entry = tc_ready;
+    last_parser_called = true;
+    ready_at_parser_entry = use_inputs ? inputs_ready : tc_ready;
+    inputs_at_parser_entry = inputs_ready;
+    next_at_parser_entry = next_measurement_id;
+}
+
+/* GNU ld wrapping observes the real parsers without changing returns or flags. */
+ssize_t __wrap_parse_test_case_buffer(const char *buf, size_t count, bool *finished)
+{
+    observe_parser_entry();
     last_parser_ret = __real_parse_test_case_buffer(buf, count, finished);
+    last_finished = *finished;
+    return last_parser_ret;
+}
+
+ssize_t __wrap_parse_input_buffer(const char *buf, size_t count, bool *finished)
+{
+    observe_parser_entry();
+    last_parser_ret = __real_parse_input_buffer(buf, count, finished);
     last_finished = *finished;
     return last_parser_ret;
 }
@@ -144,18 +164,25 @@ static void emit(const char *event, size_t requested, ssize_t ret)
            n_actors, n_inputs, total_attempts, live_bytes);
     if (ret >= 0) printf("%zd", ret); else printf("null");
     printf(",\"parser_ret\":");
-    if (parser_calls) printf("%zd", last_parser_ret); else printf("null");
+    if (last_parser_called) printf("%zd", last_parser_ret); else printf("null");
     printf(",\"parser_calls\":%zu,\"callback_ret\":", parser_calls);
     if (use_store && !strcmp(event, "feed")) printf("%zd", ret); else printf("null");
-    printf(",\"tc_ready\":%s,\"sandbox_calls\":%zu,\"code_calls\":%zu,"
+    printf(",\"tc_ready\":%s,\"inputs_ready\":%s,\"format\":\"%s\","
+           "\"sandbox_calls\":%zu,\"code_calls\":%zu,"
            "\"next_measurement_id\":%d,\"upload_id\":%zu,\"ready_before_call\":%s,"
            "\"ready_at_parser_entry\":",
-           tc_ready ? "true" : "false", sandbox_calls, code_calls, next_measurement_id,
+           tc_ready ? "true" : "false", inputs_ready ? "true" : "false",
+           use_inputs ? "rdbf" : "rcbf", sandbox_calls, code_calls, next_measurement_id,
            upload_id, ready_before_call ? "true" : "false");
-    if (use_store && parser_calls)
+    if (use_store && last_parser_called)
         printf("%s", ready_at_parser_entry ? "true" : "false");
     else
         printf("null");
+    printf(",\"inputs_at_parser_entry\":");
+    if (last_parser_called) printf("%s", inputs_at_parser_entry ? "true" : "false");
+    else printf("null");
+    printf(",\"next_at_parser_entry\":");
+    if (last_parser_called) printf("%d", next_at_parser_entry); else printf("null");
     printf(",\"metadata_allocation_bytes\":");
     if (!use_inputs && tracked(test_case, sizeof(*test_case)))
         printf("%zu", allocation_size(test_case->metadata));
@@ -200,20 +227,19 @@ static ssize_t feed(const char *source, size_t count)
     memcpy(buffer, source, count);
     buffer[count] = '\0';
     bool finished = false;
+    last_parser_called = false;
+    last_finished = false;
     ssize_t ret;
     if (use_store) {
         size_t previous_calls = parser_calls;
-        ready_before_call = tc_ready;
-        ret = host_test_case_store(buffer, count);
-        if (parser_calls != previous_calls + 1)
-            fatal("callback did not call the observed production parser exactly once");
-    } else if (use_inputs) {
-        parser_calls++;
-        ret = parse_input_buffer(buffer, count, &finished);
-        last_parser_ret = ret;
-        last_finished = finished;
+        ready_before_call = use_inputs ? inputs_ready : tc_ready;
+        ret = use_inputs ? host_inputs_store(buffer, count) : host_test_case_store(buffer, count);
+        if (parser_calls != previous_calls + 1 &&
+            !(use_inputs && parser_calls == previous_calls && ret < 0))
+            fatal("unexpected production parser call count");
     } else {
-        ret = parse_test_case_buffer(buffer, count, &finished);
+        ret = use_inputs ? parse_input_buffer(buffer, count, &finished)
+                         : parse_test_case_buffer(buffer, count, &finished);
     }
     emit("feed", count, ret);
     free(buffer);
@@ -247,7 +273,7 @@ static void seed_measurements(void)
     if (n_inputs > 64) fatal("measurement fixture bound exceeded");
     for (size_t i = 0; i < n_inputs; i++) {
         /* Twenty-digit values force pagination; small fixtures have readable results. */
-        uint64_t value = n_inputs == 64 ? ~0ULL - i : i + 1;
+        uint64_t value = n_inputs >= 33 ? ~0ULL - i : i + 1;
         owned_measurements[i].htrace[0] = value;
         for (size_t j = 0; j < NUM_PFC; j++)
             owned_measurements[i].pfc_reading[j] = value;
@@ -323,15 +349,77 @@ static int trace_scenario(int argc, char **argv)
     return live_bytes ? 66 : 0;
 }
 
+static void upload_fixture(const char *path, bool input, bool incomplete)
+{
+    char data[MAX_FILE];
+    size_t length = read_fixture(path, data);
+    if (length < 16) fatal("preparation fixture lacks a header");
+    size_t remaining = incomplete ? length - 8 : length;
+    size_t offset = 0;
+    use_inputs = input;
+    use_store = true;
+    while (remaining) {
+        size_t requested = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
+        ssize_t ret = feed(data + offset, requested);
+        if (ret < 0) break; /* Retained in JSON; the scenario can test subsequent trace rejection. */
+        if (!ret || (size_t)ret > requested) fatal("invalid upload consumption");
+        offset += (size_t)ret;
+        remaining -= (size_t)ret;
+    }
+    upload_id++;
+}
+
+static int preparation_scenario(int argc, char **argv)
+{
+    if (argc != 7) fatal("usage: harness prepare SCENARIO RCBF RDBF PAGED_RDBF WRONG_ACTOR_RDBF");
+    const char *scenario = argv[2];
+    bool normal = !strcmp(scenario, "normal");
+    bool replace_tc = !strcmp(scenario, "test-replacement");
+    bool early_input = !strcmp(scenario, "input-before-test");
+    bool incomplete = !strcmp(scenario, "input-incomplete");
+    bool error = !strcmp(scenario, "input-error");
+    bool tc_pending = !strcmp(scenario, "test-pending");
+    bool input_pending = !strcmp(scenario, "input-pending");
+    if (!(normal || replace_tc || early_input || incomplete || error || tc_pending || input_pending))
+        fatal("unknown bounded preparation scenario");
+    if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
+    measurements = owned_measurements;
+    emit("init", 0, 0);
+    if (early_input) {
+        upload_fixture(argv[4], true, false);
+        observe_trace(0);
+    } else {
+        upload_fixture(argv[3], false, false);
+        upload_fixture((normal || replace_tc) ? argv[4] : argv[5], true, false);
+        if (normal) {
+            observe_trace(0);
+        } else {
+            if (!replace_tc) observe_trace(0); /* Real first page leaves pending cursor zero. */
+            if (replace_tc || tc_pending) {
+                upload_fixture(argv[3], false, false);
+                observe_trace(1);
+                upload_fixture(argv[4], true, false);
+            } else {
+                upload_fixture(error ? argv[6] : argv[4], true, incomplete);
+            }
+            observe_trace(2);
+        }
+    }
+    free_input_parser();
+    free_test_case_parser();
+    printf("{\"event\":\"teardown\",\"live_bytes\":%zu}\n", live_bytes);
+    return live_bytes ? 66 : 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "prepare")) return preparation_scenario(argc, argv);
     if ((argc != 6 && argc != 7) || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
         (strcmp(argv[2], "direct") && strcmp(argv[2], "store")))
         fatal("usage: harness rcbf|rdbf direct|store FIXTURE PREFIX_BYTES STEP_BYTES [REPLACEMENT]");
     use_inputs = !strcmp(argv[1], "rdbf");
     use_store = !strcmp(argv[2], "store");
-    if (use_inputs && use_store) fatal("only the RCBF test_case_store callback is supported");
     char data[MAX_FILE];
     size_t length = read_fixture(argv[3], data);
     size_t count = bounded_number(argv[4], length);

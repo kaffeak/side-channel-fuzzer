@@ -319,6 +319,8 @@ static ssize_t test_case_store(struct kobject *kobj, struct kobj_attribute *attr
     int err = 0;
     // Invalidate the previous preparation before the parser can modify test-case state.
     tc_ready = false;
+    inputs_ready = false;
+    next_measurement_id = -1;
 
     bool finished = false;
     ssize_t consumed_bytes = parse_test_case_buffer(buf, count, &finished);
@@ -362,9 +364,14 @@ static ssize_t test_case_bin_read(struct file *file, struct kobject *kobj, bin_a
 static ssize_t inputs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
                             size_t count)
 {
+    inputs_ready = false;
+    next_measurement_id = -1;
+    ASSERT(tc_ready, "inputs_store");
+
     bool finished = false;
     ssize_t consumed_bytes = parse_input_buffer(buf, count, &finished);
-    inputs_ready = false;
+    if (consumed_bytes < 0)
+        return consumed_bytes;
 
     if (finished) {
         inputs_ready = true;

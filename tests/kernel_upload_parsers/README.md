@@ -1,9 +1,9 @@
 # Host upload-parser baseline
 
 This runs the repository's production `test_case_parser.c` and `input_parser.c` as host C code.
-It also compiles the exact `test_case_store()`, `check_test_case_compat()` and
-`trace_show()` definitions extracted from `main.c`, with counted success stubs
-for preparation and measurement.
+It also compiles the exact `test_case_store()`, `inputs_store()`,
+`check_test_case_compat()` and `trace_show()` definitions extracted from `main.c`,
+with counted success stubs for preparation and measurement.
 It does not load a module, execute test-case instructions, access sysfs or model
 kernel concurrency. Readiness publication, generations and failure injection
 are outside this stage.
@@ -68,10 +68,11 @@ avoids modifying parser code. Init/free functions and production parser headers,
 actor/sandbox/input structures, macro IDs and allocation/error macros are reused.
 The actual parsing entry points are `parse_test_case_buffer()` and
 `parse_input_buffer()`; there is no replacement parser. GNU linker's
-`--wrap=parse_test_case_buffer` records the real parser's return and `finished`
-flag, including inside the callback. The wrapper calls `__real_parse_test_case_buffer`
-and returns its result unchanged. The callback must invoke it exactly once per
-supplied chunk. RDBF still uses direct-parser mode only.
+`--wrap=parse_test_case_buffer` and `--wrap=parse_input_buffer` record the real
+parsers' returns and `finished` flags, including inside callbacks. The wrappers call the respective `__real_`
+parser and return its result unchanged. Accepted writes call the parser once;
+input writes rejected before parsing report `parser_ret=null`. RDBF supports
+both direct and callback modes; preparation scenarios load a test case first.
 
 Minimal generated Linux/ASM include files forward to `compat.h`. That header
 substitutes libc allocation/free and stderr logging. Two unused page-helper
@@ -93,7 +94,7 @@ visible in verbose mode. Only the extracted callback unit receives
 warnings are also retained. Harness warnings remain fatal. `-O0` makes source-level
 control flow straightforward to diagnose; optimized campaigns are not benchmarked.
 
-Memory bounds are 128 KiB per fixture, 2 MiB of tracked live parser allocations,
+Memory bounds are 512 KiB per fixture, 2 MiB of tracked live parser allocations,
 128 tracked blocks, 4096 calls and 4096 bytes per supplied chunk. Unexpected host
 allocation failures or bounds violations fail explicitly. Parser teardown must
 leave zero tracked bytes; leftover allocations produce a nonzero exit even though
@@ -241,7 +242,7 @@ Direct-parser characterization and all seven original baseline tests remain.
 The harness accepts an optional seventh argument, a replacement fixture, only in
 RCBF `store` mode after a complete first upload. It feeds the two fixtures in one
 process without reinitializing the parsers, readiness or preparation counters.
-Each fixture remains bounded to 128 KiB; the original process/call/time limits
+At that stage each fixture was bounded to 128 KiB; the process/call/time limits
 still apply. There are no simulated readiness transitions. `upload_id` separates
 the records, `ready_before_call` observes readiness before the actual callback,
 and `ready_at_parser_entry` observes it immediately before the real RCBF parser
@@ -367,7 +368,10 @@ coverage and resource-lifetime regressions also passed. Full module compilation
 was unavailable locally because kernel development trees and an ARM64 compiler
 are absent; the existing native ARM64 build configuration was not changed or run.
 
-### Input readiness and remaining identity limits
+### Input readiness and remaining identity limits at B3.3c.2
+
+These were the pre-B3.3c.3 source findings. Sequential invalidation and input
+admission are corrected below; synchronization and generation limits remain.
 
 Source inspection of `main.c:test_case_store()` shows it never clears
 `inputs_ready`. A successful replacement can therefore make both flags true
@@ -398,3 +402,121 @@ and robust input-error publication, characterize preparation failures/cleanup,
 then bind test case, inputs, allocations and result pagination to a common
 generation under synchronization. Host-stub results do not establish loaded-
 kernel or M3 compatibility. CI, serialization and 16 KB execution are unchanged.
+
+## B3.3c.3 input readiness and result invalidation
+
+Production changes are limited to the two upload callbacks in `main.c`:
+
+- `test_case_store()` clears `tc_ready`, `inputs_ready` and the pending result
+  cursor (`next_measurement_id=-1`) before parsing. Successful preparation sets
+  only `tc_ready`; inputs must be uploaded again. The existing parser-error guard
+  and preparation checks remain.
+- `inputs_store()` clears `inputs_ready` and the result cursor before checking
+  `tc_ready` and before parsing. An unprepared test case yields -EIO without a
+  parser call. A negative parser return is propagated unchanged; only nonnegative
+  completion can restore input readiness. All positive short returns are preserved.
+
+Invalidation happens on every supplied write chunk, so interrupted and failed
+uploads cannot retain readiness or a previous pagination cursor. Result buffers
+are not erased: with cursor -1, a subsequent admitted trace must invoke measurement
+again rather than resume those buffers. `unfinished_call` is not reset here.
+
+### Inspected Python compatibility
+
+No legitimate inputs-before-completed-test-case path was found in the inspected
+Python hardware executor flows. `rvzr/executor.py:258-280` writes RCBF synchronously
+via `save_rcbf()`; `:304-318` writes RDBF, verifies input readiness, then reads traces.
+Both serializers finish their `with open(..., 'wb')` block before returning
+(`rvzr/tc_components/test_case_binary.py:136` and `test_case_data.py:182`).
+Normal rounds load the executor at `rvzr/fuzzer.py:137` before hardware collection
+at `:262`. Architectural mismatch checking loads at `:383` and traces at `:392`.
+ARM64 filtering loads then traces both original and fenced cases
+(`rvzr/arch/arm64/fuzzer.py:66-67,95-96`). `ARM64Executor` inherits these upload
+methods unchanged. Architectural differential testing follows the same order at
+`rvzr/fuzzer.py:920-938`. Every non-skipped `trace_test_case()` call reuploads inputs;
+an empty/all-ignored call returns without reading hardware. No Python change is
+required. Direct sysfs clients that previously preloaded inputs before preparing
+code, or reused inputs after replacing code, must instead load code then inputs.
+Repetitions and successive result pages without intervening uploads are unchanged.
+
+### Actual callback regressions
+
+The extractor now also compiles the exact production `inputs_store()`. Both parser
+wrappers capture readiness and cursor **before** the actual parser call, together
+with original returns and completion flags. They never change parser outcomes.
+The seven new fixed scenarios use actual callback sequences, without driver-set
+readiness or parser reinitialization between uploads. They cover normal loading,
+successful code replacement and input reupload, partial replacement inputs,
+actor-count mismatch, early input rejection, and pending results discarded by
+either upload callback.
+
+Preparation mode records expected upload errors and then checks trace rejection;
+a zero driver exit means observation/teardown completed, not that those rejected
+uploads succeeded. Negative callback returns remain explicit in JSON and tests.
+
+The one-actor 33-input fixture is 405536 bytes, generated by the existing RDBF
+serializer. It produces a real 4032-byte first result page with cursor zero and
+one stubbed measurement invocation. This motivated raising the owned-file bound
+from 128 to **512 KiB**; the 2 MiB allocation, 4096-call and five-second subprocess
+bounds remain. Measurements are still owned/stubbed, not hardware observations.
+
+| Observed transition | `tc_ready` / `inputs_ready` | Result cursor / measurement calls |
+| --- | --- | --- |
+| Initial complete RCBF | true / false | -1 / 0 |
+| Initial complete RDBF | true / true | -1 / 0 |
+| First page from 33 inputs | true / true | 0 / 1 |
+| New RCBF, at parser entry | false / false | -1 / 1 |
+| Successful replacement RCBF | true / false | -1 / 1 |
+| Trace before input reupload | true / false; returns -EIO | unchanged -1 / 1 |
+| Valid one-input reupload | true / true | -1 / 1 |
+| Admitted trace after reupload | true / true | -1 / **2**; fresh 17-byte result |
+| Partial/error replacement RDBF | true / false | -1 / 1; subsequent trace rejected |
+
+The last two result-invalidation cases also replace inputs without replacing
+code. Both require a new stub call after successful reupload, with exact
+`1,1,1,1,1,1\ndone\n` formatting, rather than the old 131-byte pending page.
+The direct/parser and upload tests retain their existing positive short-return
+sequences. The normal-load test passed before correction; six new regressions
+failed against the old callbacks, then passed after the scoped production change.
+
+The deterministic error uses a fully serialized two-actor RDBF header after a
+one-actor test case. The real actor-count assertion fails; `parse_input_buffer()`
+returns -1 with `finished=false`, and `inputs_store()` returns that same -1.
+Readiness and cursor were already invalidated at parser entry. Diagnostics and
+`consumed=null` are retained; no invalid payload digest is read. Input-before-code
+rejection is separately -EIO, with `parser_ret=null` and zero parser calls.
+
+This error also exposes an existing parser-state concern: the input cursor becomes
+18446744073709551611 (unsigned -5) because the parser adds the batch-start error
+before returning -1 (`input_parser.c:100-103`). This is not an ASan/UBSan finding;
+the parser arithmetic is unchanged, and the wrapped value is not used as a harness
+memory offset. The tests stop that input stream and verify trace rejection, not
+error rollback or retry correctness.
+
+On WSL2/GCC 13.3.0, all **25** host tests passed ordinarily and in separate ASan
+and UBSan builds, with no sanitizer findings. All 102 existing input-format,
+descriptor, preparation, coverage and resource-lifetime regressions passed.
+Flake8, strict mypy, Pylint and `git diff --check` passed. The existing
+LeakSanitizer limitation remains. Full kernel-module builds were unavailable
+locally because kernel development trees and an ARM64 compiler are absent;
+the existing ARM64 CI configuration was not modified or invoked.
+
+### Remaining limits and next step
+
+Completed predecessor inputs cannot satisfy both readiness flags after the tested
+replacement sequences, and old pages cannot resume after those reuploads. This
+is not a proof for arbitrary interrupted-stream histories. Callback invalidation
+does not cancel/reset private parser receiving state; abandoning partial RDBF
+and switching test cases remains a separate source-derived reset/association risk.
+No parser rollback, allocation/code-loader failure recovery, old resource cleanup
+or transactional preparation is implemented. Actual production preparation and
+measurement functions are still stubbed here.
+
+The smallest next task is bounded characterization of abort/retry and preparation
+failure cleanup, retaining the real callbacks and independently safe observations.
+That should establish which failures leave each parser and allocator reusable
+before designing recovery transitions. Generations must eventually bind code,
+inputs, allocations and result iteration, with synchronization between publication,
+trace admission and execution. Shared globals are still unlocked, and simultaneous
+callbacks can race; these sequential tests cannot establish atomicity. No loaded-
+kernel, M3 or 16 KB runtime claim follows from this change.
