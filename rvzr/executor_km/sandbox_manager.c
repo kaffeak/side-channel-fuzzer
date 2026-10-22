@@ -18,7 +18,7 @@
 sandbox_t *sandbox = NULL; // Owns descriptor; its members are borrowed aliases.
 
 // Private ownership only: not readiness, retry policy or a synchronized snapshot.
-static struct {
+struct util_data_allocation {
     struct page *backing_head; // owns the original order-sized alloc_pages block
     int backing_order;        // valid only while backing_head is nonnull
     struct page **page_array; // owns array, whose entries borrow from the block
@@ -27,7 +27,9 @@ static struct {
     void *vaddr_aligned;      // borrowed interior alias, aligned to 8KB
     size_t usable_size;       // mapped bytes remaining after the alignment prefix
     size_t actor_capacity;    // whole actor_data_t records after sizeof(util_t)
-} util_data;
+};
+
+static struct util_data_allocation util_data;
 
 enum code_permission_request {
     CODE_PERMISSION_NOT_REQUESTED,
@@ -46,6 +48,7 @@ static struct {
 } code_data;
 
 /// @brief Free util_data allocation (vmap + physical pages)
+// Legacy published-resource path: does not establish quiescence or retire PTE references.
 static void safe_free_util_data(void)
 {
     if (util_data.vaddr_unaligned) {
@@ -112,6 +115,8 @@ static int init_sandbox_pointers(void)
 static int allocate_util_and_data(size_t n_actors)
 {
     safe_free_util_data();
+    // Unpublished per-call owner for the two acquisition-failure cleanup branches.
+    struct util_data_allocation acquired = {0};
 
     // calculate required memory sizes
     const size_t util_mem_size = sizeof(util_t);
@@ -127,46 +132,50 @@ static int allocate_util_and_data(size_t n_actors)
         PRINT_ERR("Error allocating util_and_data pages\n");
         return -ENOMEM;
     }
-    util_data.backing_head = page;
-    util_data.backing_order = order;
+    acquired.backing_head = page;
+    acquired.backing_order = order;
 
     // map the pages into kernel virtual address space
-    util_data.page_array = kmalloc(num_pages * sizeof(struct page *), GFP_KERNEL);
-    if (!util_data.page_array) {
-        __free_pages(page, order);
-        util_data.backing_head = NULL;
-        util_data.backing_order = 0;
+    acquired.page_array = kmalloc(num_pages * sizeof(struct page *), GFP_KERNEL);
+    if (!acquired.page_array) {
+        __free_pages(acquired.backing_head, acquired.backing_order);
+        acquired.backing_head = NULL;
+        acquired.backing_order = 0;
         PRINT_ERR("Error allocating page array\n");
         return -ENOMEM;
     }
 
     for (int i = 0; i < num_pages; i++) {
-        util_data.page_array[i] = page + i;
+        acquired.page_array[i] = page + i;
     }
-    util_data.num_pages = num_pages;
+    acquired.num_pages = num_pages;
 
-    util_data.vaddr_unaligned =
-        vmap(util_data.page_array, util_data.num_pages, VM_MAP, PAGE_KERNEL);
-    if (!util_data.vaddr_unaligned) {
-        kfree(util_data.page_array);
-        util_data.page_array = NULL;
-        util_data.num_pages = 0;
-        __free_pages(page, order);
-        util_data.backing_head = NULL;
-        util_data.backing_order = 0;
+    acquired.vaddr_unaligned =
+        vmap(acquired.page_array, acquired.num_pages, VM_MAP, PAGE_KERNEL);
+    if (!acquired.vaddr_unaligned) {
+        kfree(acquired.page_array);
+        acquired.page_array = NULL;
+        acquired.num_pages = 0;
+        __free_pages(acquired.backing_head, acquired.backing_order);
+        acquired.backing_head = NULL;
+        acquired.backing_order = 0;
         PRINT_ERR("Error mapping util_and_data pages\n");
         return -ENOMEM;
     }
 
     // Align to 2-page (8KB) boundary
-    unsigned long addr = (unsigned long)util_data.vaddr_unaligned;
-    util_data.vaddr_aligned = (void *)ALIGN(addr, 0x2000);
-    size_t mapped_size = (size_t)util_data.num_pages * PAGE_SIZE;
-    size_t prefix = (unsigned long)util_data.vaddr_aligned - addr;
-    util_data.usable_size = prefix <= mapped_size ? mapped_size - prefix : 0;
-    util_data.actor_capacity = util_data.usable_size >= sizeof(util_t)
-                                   ? (util_data.usable_size - sizeof(util_t)) / sizeof(actor_data_t)
-                                   : 0;
+    unsigned long addr = (unsigned long)acquired.vaddr_unaligned;
+    acquired.vaddr_aligned = (void *)ALIGN(addr, 0x2000);
+    size_t mapped_size = (size_t)acquired.num_pages * PAGE_SIZE;
+    size_t prefix = (unsigned long)acquired.vaddr_aligned - addr;
+    acquired.usable_size = prefix <= mapped_size ? mapped_size - prefix : 0;
+    acquired.actor_capacity = acquired.usable_size >= sizeof(util_t)
+                                 ? (acquired.usable_size - sizeof(util_t)) / sizeof(actor_data_t)
+                                 : 0;
+
+    // Transfer ownership only after acquisition; do not release acquired after this handoff.
+    // Publishing sandbox aliases and PTEs still happens later, without synchronization.
+    util_data = acquired;
 
     return 0;
 }
