@@ -7,6 +7,7 @@
 #include "sandbox_manager.h"
 #include "code_loader.h"
 #include "shortcuts.h"
+#include "attempt_upload.h"
 
 _Static_assert(sizeof(void *) == 8 && sizeof(uint64_t) == 8, "64-bit host required");
 
@@ -145,6 +146,12 @@ static bool tracked_range(void *base, size_t offset, size_t length)
 static bool tracked(void *pointer, size_t minimum)
 {
     return tracked_range(pointer, 0, minimum);
+}
+
+bool host_parser_roots_only(void)
+{
+    return tracked(test_case, sizeof(*test_case)) && tracked(inputs, sizeof(*inputs)) &&
+        live_bytes == allocation_size(test_case) + allocation_size(inputs);
 }
 
 static uint64_t hash_bytes(uint64_t hash, const void *pointer, size_t size)
@@ -615,8 +622,11 @@ static int reset_scenario(int argc, char **argv)
     return live_bytes ? 66 : 0;
 }
 
+#include "attempt_upload_scenarios.inc"
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "attempt")) return attempt_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "prepare")) return preparation_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "recover")) return recovery_scenario(argc, argv);

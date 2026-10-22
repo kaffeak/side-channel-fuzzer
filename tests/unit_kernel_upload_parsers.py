@@ -86,11 +86,28 @@ def _fixtures(directory: Path) -> Dict[str, Tuple[Path, bytes, int]]:
     wrong_input = InputData(2)
     wrong_input.view(np.uint8).reshape(-1)[:] = 0
     save_input_sequence_as_rdbf([wrong_input], str(wrong_actor))
+    alternate = InputData(1)
+    alternate.view(np.uint8).reshape(-1)[:] = np.bitwise_xor(pattern, 0x5A)
+    alternate_path = directory / "attempt-alternate.rdbf"
+    save_input_sequence_as_rdbf([alternate], str(alternate_path))
+    (directory / "attempt-expected.bin").write_bytes(alternate.tobytes())
     return {"rcbf": _rcbf_fixture(directory, 1), "rcbf_multi": _rcbf_fixture(directory, 3),
             "rcbf_missing_end": _rcbf_fixture(directory, 1, include_end=False),
             "rdbf_paged": (paged, input_.tobytes() * 33, 405536),
             "rdbf_wrong_actor": (wrong_actor, wrong_input.tobytes(), 24624),
+            "rdbf_alternate": (alternate_path, alternate.tobytes(), 12320),
             "rdbf": (rdbf, input_.tobytes(), 12320)}
+
+
+def _unit_flags(filename: str) -> List[str]:
+    if filename in ("test_case_parser.c", "input_parser.c"):
+        return ["-Wno-error=sign-compare"]
+    if filename == "upload_callback.c":
+        return ["-Wno-error=unused-parameter"]
+    if filename in ("harness.c", "attempt_upload.c", "preparation_state.c"):
+        # Consistent kernel u64 spelling through the existing linux/types.h shim.
+        return ["-D__KERNEL__"]
+    return []
 
 
 def _callback_unit() -> str:
@@ -209,14 +226,11 @@ bool host_input_idle(void) {
             "-fno-sanitize-recover=all", "-no-pie"]
         cls.build_commands, cls.build_diagnostics = [], ""
         objects = []
-        for source in [str(_HARNESS / "harness.c")] + units:
+        adapter_units = [str(_HARNESS / "attempt_upload.c"), str(_KERNEL / "preparation_state.c")]
+        for source in [str(_HARNESS / "harness.c")] + units + adapter_units:
             obj = cls.build_dir / (Path(source).stem + ".o")
             # Preserve existing parser signedness warnings; new harness warnings remain fatal.
-            exceptions = []
-            if Path(source).name in ("test_case_parser.c", "input_parser.c"):
-                exceptions = ["-Wno-error=sign-compare"]
-            elif Path(source).name == "upload_callback.c":
-                exceptions = ["-Wno-error=unused-parameter"]
+            exceptions = _unit_flags(Path(source).name)
             cls.build_commands.append(compiler + flags + instrumentation + exceptions
                                       + ["-c", source, "-o", str(obj)])
             objects.append(str(obj))
@@ -881,6 +895,91 @@ bool host_input_idle(void) {
 
     def test_reset_recreates_released_rdbf_root(self) -> None:
         self.check_reset_scenario("rdbf", "released")
+
+    def check_attempt_scenario(self, scenario: str, final_state: str = "READY") -> None:
+        kinds = ("rcbf", "rdbf", "rdbf_alternate", "rcbf_missing_end", "rdbf_wrong_actor")
+        command = [str(self.binary), "attempt", scenario]
+        command += [str(self.fixtures[k][0]) for k in kinds]
+        command += [str(self.build_dir / "attempt-expected.bin"),
+                    str(self.build_dir / "reset-expected-rcbf.bin")]
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        if scenario.startswith("parser-error"):
+            self.assertIn("Symbol table does not contain measurement start/end" if
+                          scenario.endswith("tc") else "Mismatch in n_actors", result.stderr)
+        else:
+            self.assertEqual(result.stderr, "")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"attempt_scenario": scenario, "records": records,
+                              "stderr": result.stderr}))
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        self.assertEqual(records[-2]["event"], "attempt_result")
+        self.assertEqual(records[-2]["state"], final_state)
+        feeds = [r for r in records if r["event"] == "attempt_feed"]
+        self.assertTrue(feeds)
+        for record in feeds:
+            self.assertEqual(record["calls_after"], record["calls_before"] + 1)
+            if record["ret"] > 0:
+                self.assertEqual(record["position"], record["before"] + record["ret"])
+                self.assertLessEqual(record["ret"], record["requested"])
+        if scenario != "phase":  # This scenario deliberately stops at the 16-byte header.
+            self.assertTrue(any(0 < r["ret"] < r["requested"] for r in feeds))
+        rejections = [r for r in records if r["event"] == "rejection"]
+        for record in rejections:
+            self.assertLess(record["ret"], 0)
+            self.assertEqual(record["calls_before"], record["calls_after"])
+            self.assertTrue(record["unchanged"])
+        if scenario.startswith("stale-"):
+            self.assertEqual([r["operation"] for r in rejections], ["feed", "complete", "abort"])
+            self.assertTrue(all(r["prefix_bytes"] == (4096 if scenario.endswith("input") else 16)
+                                for r in rejections))
+        comparisons = [r for r in records if r["event"] == "payload_comparison"]
+        self.assertTrue(all(r["equal"] for r in comparisons))
+        if final_state == "READY":
+            self.assertIn({"event": "payload_comparison", "bytes": 12288, "equal": True},
+                          comparisons)
+        if final_state == "UNRECOVERABLE":
+            self.assertEqual(records[-2]["fake_resources"], 3)
+
+    def test_attempt_valid_preparation(self) -> None:
+        self.check_attempt_scenario("valid")
+
+    def test_attempt_stale_input_before_parser(self) -> None:
+        self.check_attempt_scenario("stale-input")
+
+    def test_attempt_stale_tc_before_parser(self) -> None:
+        self.check_attempt_scenario("stale-tc")
+
+    def test_attempt_wrong_instance_kind_and_parent(self) -> None:
+        self.check_attempt_scenario("identity")
+
+    def test_attempt_premature_complete_fails_closed(self) -> None:
+        self.check_attempt_scenario("premature", "FAILED")
+
+    def test_attempt_terminal_operations(self) -> None:
+        self.check_attempt_scenario("terminal")
+
+    def test_attempt_tc_parser_failure(self) -> None:
+        self.check_attempt_scenario("parser-error-tc", "FAILED")
+
+    def test_attempt_input_parser_failure(self) -> None:
+        self.check_attempt_scenario("parser-error-input", "FAILED")
+
+    def test_attempt_cleanup_failure_prevents_retry(self) -> None:
+        self.check_attempt_scenario("cleanup-failure", "UNRECOVERABLE")
+
+    def test_attempt_abort_retry_cycles(self) -> None:
+        self.check_attempt_scenario("cycles")
+
+    def test_attempt_length_and_header_checks(self) -> None:
+        self.check_attempt_scenario("lengths", "FAILED")
+
+    def test_attempt_receiving_phase_required(self) -> None:
+        self.check_attempt_scenario("phase", "FAILED")
 
     def test_store_complete_rcbf(self) -> None:
         feeds = self.run_fixture("rcbf", True, route="store")

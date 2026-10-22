@@ -15,6 +15,8 @@ typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
+/* preparation_state.h's kernel-type branch; no kernel behavior is emulated. */
+typedef uint64_t u64;
 
 /* An explicit test configuration, never inferred from the host kernel. */
 #define PAGE_SIZE 4096

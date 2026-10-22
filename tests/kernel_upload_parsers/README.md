@@ -2,6 +2,8 @@
 
 The B3.3d.3 [explicit parser-reset implementation and results](PARSER_RESET.md)
 extend this baseline. The legacy interrupted-RDBF expected failure remains unresolved.
+The B3.3d.4a [host-only attempt-bound adapter](ATTEMPT_UPLOAD.md) combines the
+real state component and parsers behind explicit boundaries; live callbacks remain unchanged.
 
 This runs the repository's production `test_case_parser.c` and `input_parser.c` as host C code.
 It also compiles the exact `test_case_store()`, `inputs_store()`,
