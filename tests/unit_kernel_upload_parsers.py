@@ -125,7 +125,22 @@ def _callback_unit() -> str:
              '#include "shortcuts.h"\nstruct kobject;\nstruct kobj_attribute;\n'
              'extern bool tc_ready, inputs_ready, unfinished_call;\n'
              'extern int next_measurement_id;\n']
-    for name in ("check_test_case_compat", "test_case_store", "inputs_store", "trace_show"):
+    # Single-threaded boundary instrumentation, NOT an implementation of kernel mutexes.
+    parts.append('struct mutex { bool held; size_t entries; };\n'
+                 '#define DEFINE_MUTEX(name) struct mutex name = {false, 0}\n'
+                 'static void mutex_lock(struct mutex *lock)\n'
+                 '{ if (lock->held) abort(); lock->held = true; lock->entries++; }\n'
+                 'static void mutex_unlock(struct mutex *lock)\n'
+                 '{ if (!lock->held) abort(); lock->held = false; }\n')
+    declaration = re.search(r"^static DEFINE_MUTEX\(executor_mutex\);$", source, re.MULTILINE)
+    if declaration is None:
+        raise RuntimeError("Cannot isolate production coordinator mutex")
+    parts.append(declaration.group() + "\n")
+    start = source.index("// RVZR_CALLBACK_WRAPPERS_BEGIN")
+    end = source.index("// RVZR_CALLBACK_WRAPPERS_END", start)
+    parts.append(source[start:end] + "\n")
+    for name in ("check_test_case_compat", "test_case_store_unlocked", "inputs_store_unlocked",
+                 "trace_show_unlocked"):
         matches = list(re.finditer(
             rf"^static (?:int|ssize_t) {name}\([^;{{}}]*\)\n\{{\n.*?^\}}$",
             source, re.MULTILINE | re.DOTALL))
@@ -134,13 +149,29 @@ def _callback_unit() -> str:
         match = matches[0]
         line = source.count("\n", 0, match.start()) + 1
         parts.append(f"#line {line} {json.dumps(str(path))}\n{match.group()}\n")
+        if name.endswith("_unlocked"):
+            callback = name.removesuffix("_unlocked")
+            wrappers = re.findall(rf"^RVZR_LOCKED_(?:SHOW|STORE)\({callback}\)$",
+                                  source, re.MULTILINE)
+            if len(wrappers) != 1:
+                raise RuntimeError(f"Cannot isolate production wrapper for {callback}")
+            parts.append(wrappers[0] + "\n")
     parts.append('#line 1 "host_callback_adapter"\n'
+                 'bool host_callback_lock_held(void) { return executor_mutex.held; }\n'
+                 'static void check_callback_unlock(size_t before)\n'
+                 '{ if (executor_mutex.held || executor_mutex.entries != before + 1) abort(); }\n'
                  'ssize_t host_test_case_store(const char *buf, size_t count)\n'
-                 '{ return test_case_store(NULL, NULL, buf, count); }\n'
+                 '{ size_t before = executor_mutex.entries;\n'
+                 '  ssize_t ret = test_case_store(NULL, NULL, buf, count);\n'
+                 '  check_callback_unlock(before); return ret; }\n'
                  'ssize_t host_inputs_store(const char *buf, size_t count)\n'
-                 '{ return inputs_store(NULL, NULL, buf, count); }\n'
+                 '{ size_t before = executor_mutex.entries;\n'
+                 '  ssize_t ret = inputs_store(NULL, NULL, buf, count);\n'
+                 '  check_callback_unlock(before); return ret; }\n'
                  'ssize_t host_trace_show(char *buf)\n'
-                 '{ return trace_show(NULL, NULL, buf); }\n')
+                 '{ size_t before = executor_mutex.entries;\n'
+                 '  ssize_t ret = trace_show(NULL, NULL, buf);\n'
+                 '  check_callback_unlock(before); return ret; }\n')
     return "".join(parts)
 
 
@@ -152,6 +183,43 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
     build_commands: List[List[str]]
     build_diagnostics: str
     _recovery_safety_records: List[Dict[str, Any]]
+
+    def test_all_sysfs_callbacks_use_locked_wrappers(self) -> None:
+        source = (_KERNEL / "main.c").read_text(encoding="utf-8")
+        attributes = re.findall(r"__ATTR\(\w+,\s*\d+,\s*(\w+),\s*(\w+)\)", source)
+        callbacks = {name for pair in attributes for name in pair if name != "NULL"}
+        callbacks.update(name + "_read" for name in
+                         re.findall(r"__BIN_ATTR_RO\((\w+),\s*\d+\)", source))
+        wrappers = re.findall(r"^RVZR_LOCKED_(?:SHOW|STORE|BIN_READ)\((\w+)\)$",
+                              source, re.MULTILINE)
+        self.assertEqual(len(callbacks), 20)
+        self.assertCountEqual(wrappers, callbacks)
+        bodies = re.findall(r"^static ssize_t (\w+)_unlocked\(", source, re.MULTILINE)
+        self.assertCountEqual(bodies, callbacks)
+
+    def test_interface_removal_precedes_locked_destruction(self) -> None:
+        source = (_KERNEL / "main.c").read_text(encoding="utf-8")
+        exit_body = source.split("static void __exit executor_exit(void)\n{", 1)[1]
+        exit_body = exit_body.split("\n}", 1)[0]
+        operations = ["remove_executor_interfaces();", "mutex_lock(&executor_mutex);",
+                      "free_measurements();", "free_sandbox_manager();",
+                      "mutex_unlock(&executor_mutex);",
+                      "kobject_put(kobj_interface);"]
+        positions = [exit_body.index(operation) for operation in operations]
+        self.assertEqual(positions, sorted(positions))
+        removal = source.split("static void remove_executor_interfaces(void)\n{", 1)[1]
+        removal = removal.split("\n}", 1)[0]
+        self.assertNotRegex(removal, r"mutex_(?:lock|unlock)\(")
+        self.assertIn("sysfs_remove_file(", removal)
+        self.assertIn("sysfs_remove_bin_file(", removal)
+        self.assertIn("goto out_unlock;", exit_body)
+        self.assertNotRegex(exit_body, r"\breturn\s*;")
+        initialization = source.split("static int __init executor_init(void)\n{", 1)[1]
+        initialization = initialization.split("\n}", 1)[0]
+        self.assertEqual(initialization.count("mutex_lock(&executor_mutex);"), 1)
+        self.assertEqual(initialization.count("mutex_unlock(&executor_mutex);"), 1)
+        self.assertLess(initialization.index("mutex_unlock(&executor_mutex);"),
+                        initialization.index("remove_executor_interfaces();"))
 
     def setUp(self) -> None:
         if self._testMethodName == "test_recovery_interrupted_rdbf_safety_invariant":
@@ -377,6 +445,18 @@ bool host_input_idle(void) {
         expected = b"2,2,2,2,2,2\n1,1,1,1,1,1\ndone\n"
         self.assertEqual(bytes.fromhex(record["output_hex"]), expected)
         self.assertEqual(record["ret"], len(expected))
+
+    def test_trace_error_unlocks_without_claiming_recovery(self) -> None:
+        stderr, records = self.trace_records(True, True, False, "error")
+        self.assertEqual(stderr, "")
+        record = records[0]
+        self.assertEqual(record["ret"], -errno.EIO)
+        self.assertEqual(record["trace_calls"], 1)
+        self.assertEqual(record["next_after"], -1)
+        self.assertTrue(record["buffer_unchanged"])
+        # Existing legacy state, not evidence of native recovery: the adapter separately
+        # requires one acquisition and a released boundary even on this negative return.
+        self.assertTrue(record["unfinished_after"])
 
     def test_trace_ready_pending_results_do_not_remeasure(self) -> None:
         stderr, records = self.trace_records(True, True, False, "pending")

@@ -26,6 +26,7 @@ static bool ready_before_call, ready_at_parser_entry;
 static bool last_parser_called, inputs_at_parser_entry;
 static int next_at_parser_entry;
 static int sandbox_result, code_result, last_sandbox_ret, last_code_ret;
+static int trace_result;
 static bool reset_root_preserved;
 
 /* Storage for the actual callback's globals, with the production initial values. */
@@ -44,11 +45,13 @@ bool host_input_idle(void);
 ssize_t host_test_case_store(const char *buf, size_t count);
 ssize_t host_inputs_store(const char *buf, size_t count);
 ssize_t host_trace_show(char *buf);
+bool host_callback_lock_held(void);
 ssize_t __real_parse_test_case_buffer(const char *buf, size_t count, bool *finished);
 ssize_t __real_parse_input_buffer(const char *buf, size_t count, bool *finished);
 
 static void observe_parser_entry(void)
 {
+    if (use_store && !host_callback_lock_held()) abort();
     parser_calls++;
     last_parser_called = true;
     ready_at_parser_entry = use_inputs ? inputs_ready : tc_ready;
@@ -76,6 +79,7 @@ ssize_t __wrap_parse_input_buffer(const char *buf, size_t count, bool *finished)
 /* Counted return-value stubs only: no sandbox allocation or test-case code loading. */
 int allocate_sandbox(void)
 {
+    if (!host_callback_lock_held()) abort();
     sandbox_calls++;
     last_sandbox_ret = sandbox_result;
     return last_sandbox_ret;
@@ -83,6 +87,7 @@ int allocate_sandbox(void)
 
 int load_sandbox_code(void)
 {
+    if (!host_callback_lock_held()) abort();
     code_calls++;
     last_code_ret = code_result;
     return last_code_ret;
@@ -302,12 +307,13 @@ static void seed_measurements(void)
     }
 }
 
-/* Success stub only. Admission must be enforced by the real trace_show(), not here. */
+/* Return-value stub only; neither successful execution nor CPU recovery is modeled. */
 int trace_test_case(void)
 {
+    if (!host_callback_lock_held()) abort();
     trace_calls++;
     seed_measurements();
-    return 0;
+    return trace_result;
 }
 
 static void observe_trace(size_t page)
@@ -345,12 +351,13 @@ static bool boolean_argument(const char *text)
 static int trace_scenario(int argc, char **argv)
 {
     if (argc != 6 || (strcmp(argv[5], "execute") && strcmp(argv[5], "pending") &&
-                      strcmp(argv[5], "paginate")))
-        fatal("usage: harness trace TC_READY INPUTS_READY UNFINISHED execute|pending|paginate");
+                      strcmp(argv[5], "paginate") && strcmp(argv[5], "error")))
+        fatal("usage: harness trace TC_READY INPUTS_READY UNFINISHED execute|pending|paginate|error");
     bool selected_tc = boolean_argument(argv[2]);
     bool selected_inputs = boolean_argument(argv[3]);
     unfinished_call = boolean_argument(argv[4]);
     bool paginate = !strcmp(argv[5], "paginate");
+    trace_result = !strcmp(argv[5], "error") ? -EIO : 0;
     if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
     tc_ready = paginate ? true : selected_tc;
     inputs_ready = paginate ? true : selected_inputs;

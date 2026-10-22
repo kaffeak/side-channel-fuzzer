@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <linux/version.h>
 #include <linux/kobject.h>
@@ -101,6 +102,44 @@ bool inputs_ready = false;
 bool tc_ready = false;
 
 bool unfinished_call = false;
+
+// Process-context entry serialization only; not proof of successful fault recovery.
+static DEFINE_MUTEX(executor_mutex);
+
+// RVZR_CALLBACK_WRAPPERS_BEGIN
+// Inner bodies may return through ASSERT/CHECK_ERR; the outer callback always unlocks.
+#define RVZR_LOCKED_SHOW(name)                                                                     \
+    static ssize_t name(struct kobject *kobj, struct kobj_attribute *attr, char *buf)                \
+    {                                                                                            \
+        ssize_t ret;                                                                             \
+        mutex_lock(&executor_mutex);                                                             \
+        ret = name##_unlocked(kobj, attr, buf);                                                   \
+        mutex_unlock(&executor_mutex);                                                           \
+        return ret;                                                                              \
+    }
+
+#define RVZR_LOCKED_STORE(name)                                                                    \
+    static ssize_t name(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,          \
+                        size_t count)                                                            \
+    {                                                                                            \
+        ssize_t ret;                                                                             \
+        mutex_lock(&executor_mutex);                                                             \
+        ret = name##_unlocked(kobj, attr, buf, count);                                            \
+        mutex_unlock(&executor_mutex);                                                           \
+        return ret;                                                                              \
+    }
+
+#define RVZR_LOCKED_BIN_READ(name)                                                                 \
+    static ssize_t name(struct file *file, struct kobject *kobj, bin_attr_t *bin_attr, char *to,     \
+                        loff_t pos, size_t count)                                                 \
+    {                                                                                            \
+        ssize_t ret;                                                                             \
+        mutex_lock(&executor_mutex);                                                             \
+        ret = name##_unlocked(file, kobj, bin_attr, to, pos, count);                               \
+        mutex_unlock(&executor_mutex);                                                           \
+        return ret;                                                                              \
+    }
+// RVZR_CALLBACK_WRAPPERS_END
 
 // =================================================================================================
 // SysFS interface to the module
@@ -245,7 +284,7 @@ static struct bin_attribute *bin_sysfs_attributes[] = {
 // Implementation of the sysfs attributes
 
 int next_measurement_id = -1;
-static ssize_t trace_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t trace_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     int count = 0;
     int retval = 0;
@@ -284,6 +323,7 @@ static ssize_t trace_show(struct kobject *kobj, struct kobj_attribute *attr, cha
     count += sprintf(&buf[count], "done\n");
     return count;
 }
+RVZR_LOCKED_SHOW(trace_show)
 
 /// @brief Check if the parsed test case is compatible with the current CPU
 /// @param void
@@ -313,7 +353,7 @@ static int check_test_case_compat(void)
     return err;
 }
 
-static ssize_t test_case_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
+static ssize_t test_case_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
                                size_t count)
 {
     int err = 0;
@@ -345,8 +385,9 @@ static ssize_t test_case_store(struct kobject *kobj, struct kobj_attribute *attr
     tc_ready = true;
     return consumed_bytes;
 }
+RVZR_LOCKED_STORE(test_case_store)
 
-static ssize_t test_case_bin_read(struct file *file, struct kobject *kobj, bin_attr_t *bin_attr,
+static ssize_t test_case_bin_read_unlocked(struct file *file, struct kobject *kobj, bin_attr_t *bin_attr,
                                   char *to, loff_t pos, size_t count)
 {
     loff_t max_pos = n_actors * sizeof(actor_code_t);
@@ -360,8 +401,9 @@ static ssize_t test_case_bin_read(struct file *file, struct kobject *kobj, bin_a
     memcpy(to, &loaded_test_case_entry[pos], count);
     return count;
 }
+RVZR_LOCKED_BIN_READ(test_case_bin_read)
 
-static ssize_t inputs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
+static ssize_t inputs_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
                             size_t count)
 {
     inputs_ready = false;
@@ -378,36 +420,42 @@ static ssize_t inputs_store(struct kobject *kobj, struct kobj_attribute *attr, c
     }
     return consumed_bytes;
 }
+RVZR_LOCKED_STORE(inputs_store)
 
-static ssize_t inputs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t inputs_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     // FIXME: not implemented yet. See Flavien's branch for a reference implementation
     return sprintf(buf, "%d\n", inputs_ready);
 }
+RVZR_LOCKED_SHOW(inputs_show)
 
-static ssize_t warmups_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t warmups_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     return sprintf(buf, "%ld\n", uarch_reset_rounds);
 }
+RVZR_LOCKED_SHOW(warmups_show)
 
-static ssize_t warmups_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
+static ssize_t warmups_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr, const char *buf,
                              size_t count)
 {
     sscanf(buf, "%ld", &uarch_reset_rounds);
     return count;
 }
+RVZR_LOCKED_STORE(warmups_store)
 
-static ssize_t print_data_base_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t print_data_base_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     return sprintf(buf, "%llx\n", (long long unsigned)&sandbox->data[0]);
 }
+RVZR_LOCKED_SHOW(print_data_base_show)
 
-static ssize_t print_code_base_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t print_code_base_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     return sprintf(buf, "%llx\n", (long long unsigned)loaded_test_case_entry);
 }
+RVZR_LOCKED_SHOW(print_code_base_show)
 
-static ssize_t enable_ssbp_patch_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t enable_ssbp_patch_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                        const char *buf, size_t count)
 {
     unsigned value = 0;
@@ -415,8 +463,9 @@ static ssize_t enable_ssbp_patch_store(struct kobject *kobj, struct kobj_attribu
     enable_ssbp_patch = (value == 0) ? false : true;
     return count;
 }
+RVZR_LOCKED_STORE(enable_ssbp_patch_store)
 
-static ssize_t enable_prefetcher_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t enable_prefetcher_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                        const char *buf, size_t count)
 {
     unsigned value = 0;
@@ -424,8 +473,9 @@ static ssize_t enable_prefetcher_store(struct kobject *kobj, struct kobj_attribu
     enable_prefetchers = (value == 0) ? false : true;
     return count;
 }
+RVZR_LOCKED_STORE(enable_prefetcher_store)
 
-static ssize_t enable_pre_run_flush_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t enable_pre_run_flush_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                           const char *buf, size_t count)
 {
     unsigned value = 0;
@@ -433,8 +483,9 @@ static ssize_t enable_pre_run_flush_store(struct kobject *kobj, struct kobj_attr
     pre_run_flush = (value == 0) ? 0 : 1;
     return count;
 }
+RVZR_LOCKED_STORE(enable_pre_run_flush_store)
 
-static ssize_t enable_hpa_gpa_collisions_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t enable_hpa_gpa_collisions_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                                const char *buf, size_t count)
 {
     unsigned value = 0;
@@ -442,8 +493,9 @@ static ssize_t enable_hpa_gpa_collisions_store(struct kobject *kobj, struct kobj
     enable_hpa_gpa_collisions = (value == 0) ? false : true;
     return count;
 }
+RVZR_LOCKED_STORE(enable_hpa_gpa_collisions_store)
 
-static ssize_t measurement_mode_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t measurement_mode_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                       const char *buf, size_t count)
 {
     switch (buf[0]) {
@@ -470,8 +522,9 @@ static ssize_t measurement_mode_store(struct kobject *kobj, struct kobj_attribut
     quick_and_dirty_mode = false; // updating the measurement mode resets the Q&D mode
     return count;
 }
+RVZR_LOCKED_STORE(measurement_mode_store)
 
-static ssize_t enable_quick_and_dirty_mode(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t enable_quick_and_dirty_mode_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                            const char *buf, size_t count)
 {
 
@@ -504,8 +557,9 @@ static ssize_t enable_quick_and_dirty_mode(struct kobject *kobj, struct kobj_att
     }
     return count;
 }
+RVZR_LOCKED_STORE(enable_quick_and_dirty_mode)
 
-static ssize_t enable_dbg_gpr_mode(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t enable_dbg_gpr_mode_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                    const char *buf, size_t count)
 {
     unsigned value = 0;
@@ -513,13 +567,15 @@ static ssize_t enable_dbg_gpr_mode(struct kobject *kobj, struct kobj_attribute *
     dbg_gpr_mode = (value == 0) ? false : true;
     return count;
 }
+RVZR_LOCKED_STORE(enable_dbg_gpr_mode)
 
-static ssize_t handled_faults_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t handled_faults_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     return sprintf(buf, "0x%llx\n", (unsigned long long)handled_faults);
 }
+RVZR_LOCKED_SHOW(handled_faults_show)
 
-static ssize_t handled_faults_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t handled_faults_store_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                     const char *buf, size_t count)
 {
     unsigned long long value;
@@ -529,10 +585,11 @@ static ssize_t handled_faults_store(struct kobject *kobj, struct kobj_attribute 
     handled_faults = value | HANDLED_FAULTS_DEFAULT;
     return count;
 }
+RVZR_LOCKED_STORE(handled_faults_store)
 
 /// Dump all global variables
 ///
-static ssize_t dbg_dump_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t dbg_dump_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     int len = 0;
     len += sprintf(&buf[len], "n_actors: %lu\n", n_actors);
@@ -555,9 +612,10 @@ static ssize_t dbg_dump_show(struct kobject *kobj, struct kobj_attribute *attr, 
     len += sprintf(&buf[len], "pre_run_flush: %d\n", pre_run_flush);
     return len;
 }
+RVZR_LOCKED_SHOW(dbg_dump_show)
 
 /// Dump guest page tables into the kernel log
-static ssize_t dbg_guest_page_tables_show(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t dbg_guest_page_tables_show_unlocked(struct kobject *kobj, struct kobj_attribute *attr,
                                           char *buf)
 {
     if (n_actors < 2)
@@ -571,6 +629,7 @@ static ssize_t dbg_guest_page_tables_show(struct kobject *kobj, struct kobj_attr
         return err;
     return sprintf(buf, "done (see dmesg)\n");
 }
+RVZR_LOCKED_SHOW(dbg_guest_page_tables_show)
 
 // =================================================================================================
 // Initialization and Memory Management
@@ -664,7 +723,19 @@ static int check_cpu_compat(void)
     return 0;
 }
 
-static int __init executor_init(void)
+// Never hold executor_mutex while removing attributes: removal drains callbacks
+// which may themselves be waiting for that mutex. Missing files are harmless.
+static void remove_executor_interfaces(void)
+{
+    if (!kobj_interface)
+        return;
+    for (int i = 0; sysfs_attributes[i]; i++)
+        sysfs_remove_file(kobj_interface, sysfs_attributes[i]);
+    for (int i = 0; bin_sysfs_attributes[i]; i++)
+        sysfs_remove_bin_file(kobj_interface, bin_sysfs_attributes[i]);
+}
+
+static int __init executor_init_resources(void)
 {
     int err = 0;
 
@@ -705,6 +776,18 @@ static int __init executor_init(void)
 #endif
     CHECK_ERR("executor_init");
 
+    return 0;
+}
+
+static int __init executor_init(void)
+{
+    int err;
+    mutex_lock(&executor_mutex);
+    err = executor_init_resources();
+    mutex_unlock(&executor_mutex);
+    if (err)
+        return err;
+
     // Create a pseudo file system interface
     kobj_interface = kobject_create_and_add(SYSFS_DIRNAME, kernel_kobj->parent);
     if (!kobj_interface) {
@@ -725,6 +808,7 @@ static int __init executor_init(void)
     }
     if (err != 0) {
         printk(KERN_ERR "rvzr_executor: Failed to create a sysfs group\n");
+        remove_executor_interfaces();
         kobject_put(kobj_interface);
         return err;
     }
@@ -741,6 +825,7 @@ static int __init executor_init(void)
     }
     if (err != 0) {
         printk(KERN_ERR "rvzr_executor: Failed to create a binary sysfs files\n");
+        remove_executor_interfaces();
         kobject_put(kobj_interface);
         return err;
     }
@@ -750,11 +835,14 @@ static int __init executor_init(void)
 
 static void __exit executor_exit(void)
 {
+    // Drain every registered callback before destruction, without lock inversion.
+    remove_executor_interfaces();
+    mutex_lock(&executor_mutex);
     if (unfinished_call) {
         PRINT_ERR("CRITICAL ERROR: executor crashed while handling a sysfs call\n"
                   "Removing the module is no longer safe as it may lead to system blocking\n"
                   "Reboot to remove the module\n");
-        return;
+        goto out_unlock;
     }
 
     free_measurements();
@@ -778,7 +866,8 @@ static void __exit executor_exit(void)
     if (cpuinfo)
         kfree(cpuinfo);
 #endif
-
+out_unlock:
+    mutex_unlock(&executor_mutex);
     if (kobj_interface)
         kobject_put(kobj_interface);
 }

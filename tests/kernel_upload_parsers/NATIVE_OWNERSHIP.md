@@ -1,5 +1,10 @@
 # B3.3d.5a–5b: native sandbox ownership and unpublished release
 
+Stage 5c subsequently adds entry-point serialization; see
+[SYNCHRONIZATION.md](SYNCHRONIZATION.md) for the current boundary and teardown
+constraints. The stage-5b inspection below records the earlier state; published
+cleanup and restoration prerequisites remain outstanding.
+
 Stage 5a records actual acquisitions in
 [sandbox_manager.c](../../rvzr/executor_km/sandbox_manager.c). Stage 5b uses that
 record for the two unpublished acquisition-failure releases. Neither establishes
