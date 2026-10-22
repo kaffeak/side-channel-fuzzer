@@ -619,6 +619,92 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
         self.check_rejected_trace(traces[0], trace_calls=0, tc_completed=False)
         self.check_rejected_trace(traces[1], trace_calls=0)
 
+    def failure_records(self, stage: str, replacement: bool) -> Tuple[str, List[Dict[str, Any]]]:
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        paths = [self.fixtures[key][0] for key in ("rcbf", "rdbf", "rdbf_paged")]
+        result = subprocess.run(
+            [str(self.binary), "failure", stage, "replacement" if replacement else "first"]
+            + list(map(str, paths)), capture_output=True, text=True, check=False,
+            timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(records[0]["event"], "init")
+        self.assertFalse(records[0]["tc_ready"])
+        self.assertFalse(records[0]["inputs_ready"])
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"failure_stage": stage, "replacement": replacement,
+                              "records": records, "stderr": result.stderr}))
+        return result.stderr, records[1:-1]
+
+    def check_preparation_failure(self, stage: str, replacement: bool) -> None:
+        stderr, records = self.failure_records(stage, replacement)
+        self.assertIn("Error [allocate_sandbox]" if stage == "allocation"
+                      else "Error [load_sandbox_code]", stderr)
+        self.assertEqual(stderr.count("Assertion failed: tc_ready && inputs_ready"), 2)
+        base = int(replacement)
+        failure_id = 2 * base
+        failed = [r for r in records if r["event"] == "feed" and r["upload_id"] == failure_id]
+        self.assertEqual([r["parser_ret"] for r in failed], [16, 48, 96, 24, 36])
+        self.assertEqual([r["callback_ret"] for r in failed], [16, 48, 96, 24, -errno.EIO])
+        self.assertEqual(failed[-1]["cursor"], 220)
+        self.assertTrue(failed[-1]["finished"])
+        self.assertFalse(failed[-1]["receiving"])
+        self.assertIsNone(failed[-1]["consumed"])
+        self.assertEqual(failed[-1]["hash"], _hash(self.fixtures["rcbf"][1]))
+        for record in failed:
+            self.assertFalse(record["tc_ready"])
+            self.assertFalse(record["inputs_ready"])
+            self.assertFalse(record["inputs_at_parser_entry"])
+            self.assertEqual(record["next_at_parser_entry"], -1)
+            self.assertEqual(record["next_measurement_id"], -1)
+        for record in failed[:-1]:
+            self.assertEqual(record["sandbox_calls"], base)
+            self.assertEqual(record["code_calls"], base)
+        self.assertEqual(failed[-1]["sandbox_calls"], base + 1)
+        self.assertEqual(failed[-1]["code_calls"], base + int(stage == "code"))
+        self.assertEqual(failed[-1]["sandbox_ret"], -errno.ENOMEM if stage == "allocation" else 0)
+        self.assertEqual(failed[-1]["code_ret"], -errno.EINVAL if stage == "code"
+                         else (0 if replacement else None))
+
+        retry = [r for r in records if r["event"] == "feed" and r["upload_id"] == failure_id + 1]
+        self.assertEqual([r["parser_ret"] for r in retry], [16, 48, 96, 24, 36])
+        self.assertEqual([r["callback_ret"] for r in retry], [16, 48, 96, 24, 36])
+        self.assertTrue(retry[-1]["tc_ready"])
+        self.assertFalse(retry[-1]["inputs_ready"])
+        self.assertEqual(retry[-1]["sandbox_calls"], base + 2)
+        self.assertEqual(retry[-1]["code_calls"], base + int(stage == "code") + 1)
+        self.assertEqual(retry[-1]["sandbox_ret"], 0)
+        self.assertEqual(retry[-1]["code_ret"], 0)
+        traces = [r for r in records if r["event"] == "trace"]
+        if replacement:
+            self.assertEqual(traces[0]["trace_calls"], 1)
+            self.assertEqual(traces[0]["ret"], 4032)
+            self.assertEqual(traces[0]["next_after"], 0)
+        self.check_rejected_trace(traces[base], trace_calls=base)
+        self.assertFalse(traces[base]["tc_ready"])
+        self.assertFalse(traces[base]["inputs_ready"])
+        self.assertEqual(traces[base]["next_before"], -1)
+        self.check_rejected_trace(traces[base + 1], trace_calls=base)
+        self.assertTrue(traces[base + 1]["tc_ready"])
+        self.assertFalse(traces[base + 1]["inputs_ready"])
+        restored = self.check_input_upload(records, failure_id + 2, [16, 16, 4096, 4096, 4096])
+        self.assertTrue(restored[-1]["inputs_ready"])
+        self.check_fresh_single_trace(traces[-1], calls=base + 1)
+
+    def test_preparation_first_allocation_failure_and_retry(self) -> None:
+        self.check_preparation_failure("allocation", replacement=False)
+
+    def test_preparation_first_code_failure_and_retry(self) -> None:
+        self.check_preparation_failure("code", replacement=False)
+
+    def test_preparation_replacement_allocation_failure_and_retry(self) -> None:
+        self.check_preparation_failure("allocation", replacement=True)
+
+    def test_preparation_replacement_code_failure_and_retry(self) -> None:
+        self.check_preparation_failure("code", replacement=True)
+
     def test_store_complete_rcbf(self) -> None:
         feeds = self.run_fixture("rcbf", True, route="store")
         self.assertEqual([record["ret"] for record in feeds], [16, 48, 96, 24, 36])

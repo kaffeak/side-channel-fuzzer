@@ -3,10 +3,11 @@
 This runs the repository's production `test_case_parser.c` and `input_parser.c` as host C code.
 It also compiles the exact `test_case_store()`, `inputs_store()`,
 `check_test_case_compat()` and `trace_show()` definitions extracted from `main.c`,
-with counted success stubs for preparation and measurement.
+with counted stubs for preparation and measurement. Preparation stubs default to
+success and have selectable bounded errors in the failure scenarios below.
 It does not load a module, execute test-case instructions, access sysfs or model
-kernel concurrency. Readiness publication, generations and failure injection
-are outside this stage.
+kernel concurrency. Descriptor publication, generations and real allocator
+failure injection remain outside this stage.
 
 From a checkout with Revizor's Python dependencies and a native compiler:
 
@@ -660,3 +661,73 @@ test-case generation. Trace admission and pagination must enforce the same
 identity under synchronization. A generation descriptor alone does not delimit
 streams or make shared globals atomic. Endpoint names, ownership and locking are
 not implemented by this characterization stage.
+
+## B3.3c.4b preparation failure returns and ownership
+
+The production resource audit is in
+[RESOURCE_OWNERSHIP.md](RESOURCE_OWNERSHIP.md). It documents acquisition, apparent
+ownership, release paths, partial failure and reuse for utility/data pages and
+mapping, page arrays, code/executable permissions, sandbox aliases/descriptor,
+PTE caches/snapshots, code/fault-handler metadata, parser buffers and results.
+It distinguishes explicit source control flow from untested kernel behavior.
+
+Actual allocator/code-loader functions remain stubbed: native pages, vmap/PTE
+walking and executable-permission APIs are not host facilities, and loading the
+real ARM64 template/macro implementation would require native architecture
+dependencies. No replacement memory-manager model is introduced. The same actual
+`test_case_store()` is compiled; the stubs only count calls and return configured
+results. The bounded mode is:
+
+```text
+parser-baseline failure allocation|code first|replacement RCBF RDBF PAGED_RDBF
+```
+
+`allocation` makes `allocate_sandbox()` return -ENOMEM. `code` makes allocation
+return zero and `load_sandbox_code()` return -EINVAL. These are synthetic
+function-return conditions, not reproduction of a specific native allocation or
+macro-expansion failure. The callback uses its production `CHECK_ERR` macro and
+returns **-EIO** for either nonzero preparation result, after successful parsing.
+The final parser return is 36 with `finished=true`; earlier returns remain
+16, 48, 96 and 24. JSON distinguishes this from the callback's final -EIO and
+`consumed=null`. The decoded-payload digest remains correct: parsing success is
+not preparation readiness.
+
+The replacement scenarios first prepare code and a real 33-input batch, then
+use actual `trace_show()` with a successful measurement stub to leave result
+cursor zero after its 4032-byte first page. Failed replacement invalidates that
+pending cursor before parsing. Each scenario then clears **only** the stub error
+and uploads a fresh valid RCBF in the same process, without resetting parser
+state, flags or counters. Before uploading fresh inputs, a second trace probe
+must still be rejected even though code preparation has now succeeded.
+
+| Failure point | When | Cumulative allocation / code calls at failure | Calls after successful code retry | Measurement calls before / after failure probe / after input reupload and trace |
+| --- | --- | --- | --- | --- |
+| Allocation returns -ENOMEM | First preparation | 1 / **0** | 2 / 1 | 0 / 0 / 1 |
+| Code loading returns -EINVAL | First preparation | 1 / 1 | 2 / 2 | 0 / 0 / 1 |
+| Allocation returns -ENOMEM | Replacement | 2 / **1** | 3 / 2 | 1 / 1 / 2 |
+| Code loading returns -EINVAL | Replacement | 2 / 2 | 3 / 3 | 1 / 1 / 2 |
+
+In all four failure cases the callback returns -EIO, both readiness flags are
+false, cursor is -1, and the trace probe returns -EIO without changing cursor,
+`unfinished_call` or the output buffer. Failed allocation skips code loading.
+Following successful code retry, only `tc_ready` is true. Reuploading valid inputs
+restores both flags and admits fresh stubbed measurement with the exact expected
+17-byte single-input output. No old result page resumes in these sequences.
+The new `sandbox_ret` / `code_ret` fields record each function's **last actual
+stub return**, or null if never called; invocation counts distinguish a skipped
+code loader from a retained earlier successful return.
+
+Four new test methods cover these failures and a subsequent successful callback
+retry after **each** one. Ordinary, separate ASan and separate UBSan runs each
+report **33 tests: 32 passed and the existing 1 expected failure**. No sanitizer
+finding appeared; the LeakSanitizer limitation remains. All 102 existing
+input-format, descriptor, preparation, coverage and resource-lifetime regressions
+passed, along with Flake8, strict mypy, Pylint and `git diff --check`.
+
+No production source, CI or interrupted-RDBF safety test was changed. That
+expected failure still records a real unresolved safety requirement; it is not
+a passing safety assertion. The failed native preparation may already have freed,
+replaced, zeroed or partially overwritten resources that these stubs never own.
+Consequently successful host retry proves parser/callback sequencing only, not
+native retry safety or resource cleanup. Those responsibilities and the smallest
+proposed B3.3d milestone are listed in the ownership audit.

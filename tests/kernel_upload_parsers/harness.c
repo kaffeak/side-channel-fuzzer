@@ -24,6 +24,7 @@ static size_t upload_id;
 static bool ready_before_call, ready_at_parser_entry;
 static bool last_parser_called, inputs_at_parser_entry;
 static int next_at_parser_entry;
+static int sandbox_result, code_result, last_sandbox_ret, last_code_ret;
 
 /* Storage for the actual callback's globals, with the production initial values. */
 bool tc_ready = false;
@@ -68,17 +69,19 @@ ssize_t __wrap_parse_input_buffer(const char *buf, size_t count, bool *finished)
     return last_parser_ret;
 }
 
-/* Counted success stubs only: no sandbox allocation or test-case code loading. */
+/* Counted return-value stubs only: no sandbox allocation or test-case code loading. */
 int allocate_sandbox(void)
 {
     sandbox_calls++;
-    return 0;
+    last_sandbox_ret = sandbox_result;
+    return last_sandbox_ret;
 }
 
 int load_sandbox_code(void)
 {
     code_calls++;
-    return 0;
+    last_code_ret = code_result;
+    return last_code_ret;
 }
 
 static void fatal(const char *message)
@@ -178,6 +181,10 @@ static void emit(const char *event, size_t requested, ssize_t ret)
         printf("%s", ready_at_parser_entry ? "true" : "false");
     else
         printf("null");
+    printf(",\"sandbox_ret\":");
+    if (sandbox_calls) printf("%d", last_sandbox_ret); else printf("null");
+    printf(",\"code_ret\":");
+    if (code_calls) printf("%d", last_code_ret); else printf("null");
     printf(",\"inputs_at_parser_entry\":");
     if (last_parser_called) printf("%s", inputs_at_parser_entry ? "true" : "false");
     else printf("null");
@@ -459,11 +466,46 @@ static int recovery_scenario(int argc, char **argv)
     return live_bytes ? 66 : 0;
 }
 
+static int preparation_failure_scenario(int argc, char **argv)
+{
+    if (argc != 7 || (strcmp(argv[2], "allocation") && strcmp(argv[2], "code")) ||
+        (strcmp(argv[3], "first") && strcmp(argv[3], "replacement")))
+        fatal("usage: harness failure allocation|code first|replacement RCBF RDBF PAGED_RDBF");
+    bool allocation = !strcmp(argv[2], "allocation");
+    bool replacement = !strcmp(argv[3], "replacement");
+    if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
+    measurements = owned_measurements;
+    emit("init", 0, 0);
+    if (replacement) {
+        upload_fixture(argv[4], false, false);
+        upload_fixture(argv[6], true, false);
+        observe_trace(0); /* Actual callback leaves the 33rd owned result pending. */
+    }
+    sandbox_result = allocation ? -ENOMEM : 0;
+    code_result = allocation ? 0 : -EINVAL;
+    upload_fixture(argv[4], false, false);
+    observe_trace(1);
+
+    /* Clear only the simulated error. Do not reset parsers, readiness, counters or resources. */
+    sandbox_result = 0;
+    code_result = 0;
+    upload_fixture(argv[4], false, false);
+    observe_trace(2); /* Preparing code alone must not restore old input readiness. */
+    upload_fixture(argv[5], true, false);
+    observe_trace(3);
+
+    free_input_parser();
+    free_test_case_parser();
+    printf("{\"event\":\"teardown\",\"live_bytes\":%zu}\n", live_bytes);
+    return live_bytes ? 66 : 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "prepare")) return preparation_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "recover")) return recovery_scenario(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "failure")) return preparation_failure_scenario(argc, argv);
     if ((argc != 6 && argc != 7) || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
         (strcmp(argv[2], "direct") && strcmp(argv[2], "store")))
         fatal("usage: harness rcbf|rdbf direct|store FIXTURE PREFIX_BYTES STEP_BYTES [REPLACEMENT]");
