@@ -1,5 +1,8 @@
 # Host upload-parser baseline
 
+The B3.3d.3 [explicit parser-reset implementation and results](PARSER_RESET.md)
+extend this baseline. The legacy interrupted-RDBF expected failure remains unresolved.
+
 This runs the repository's production `test_case_parser.c` and `input_parser.c` as host C code.
 It also compiles the exact `test_case_store()`, `inputs_store()`,
 `check_test_case_compat()` and `trace_show()` definitions extracted from `main.c`,

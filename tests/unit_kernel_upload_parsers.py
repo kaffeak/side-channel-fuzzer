@@ -6,6 +6,8 @@ Use unittest -f to stop immediately on instrumented failures; never pad allocati
 """
 
 # pylint: disable=missing-class-docstring,missing-function-docstring
+# Keep parser/reset scenarios on the same native-build fixture.
+# pylint: disable=too-many-lines
 
 import errno
 import json
@@ -158,12 +160,38 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text('#include "compat.h"\n', encoding="utf-8")
         units = []
+        idle_checks = {
+            "test_case_parser.c": """
+bool host_tc_idle(void) {
+    return !_is_receiving_test_case && _cursor == 0 && n_actors == 0 && n_symbols == 0 &&
+        curr_section_id == 0 && curr_section_start == 0 && curr_section_end == 0 &&
+        highest_n_actors == 0 && highest_n_symbols == 0 && actors == NULL &&
+        _allocated_actor_table == NULL && _allocated_symbol_table == NULL &&
+        _allocated_metadata == NULL && _allocated_data == NULL && test_case != NULL &&
+        test_case->actor_table_size == 0 && test_case->symbol_table_size == 0 &&
+        test_case->metadata_size == 0 && test_case->sections_size == 0 &&
+        test_case->actor_table == NULL && test_case->symbol_table == NULL &&
+        test_case->metadata == NULL && test_case->sections == NULL &&
+        !test_case->features.includes_vm_actors && !test_case->features.includes_user_actors &&
+        !test_case->features.has_explicit_fault_handler;
+}
+""",
+            "input_parser.c": """
+bool host_input_idle(void) {
+    return !is_receiving_inputs && cursor == 0 && n_inputs == 0 &&
+        highest_n_actors == 0 && highest_n_inputs == 0 && allocated_metadata == NULL &&
+        allocated_data == NULL && inputs != NULL && inputs->metadata_size == 0 &&
+        inputs->data_size == 0 && inputs->metadata == NULL && inputs->data == NULL;
+}
+""",
+        }
         for filename, helper, cursor in (("test_case_parser.c", "host_tc_cursor", "_cursor"),
                                          ("input_parser.c", "host_input_cursor", "cursor")):
             unit = cls.build_dir / filename
-            # Including each unchanged .c in its own TU exposes only a read-only cursor accessor.
+            # Include actual sources, appending read-only observations of private reset state.
             unit.write_text(f"#include {json.dumps(str(_KERNEL / filename))}\n"
-                            f"uint64_t {helper}(void) {{ return {cursor}; }}\n", encoding="utf-8")
+                            f"uint64_t {helper}(void) {{ return {cursor}; }}\n"
+                            + idle_checks[filename], encoding="utf-8")
             units.append(str(unit))
         callback = cls.build_dir / "upload_callback.c"
         callback.write_text(_callback_unit(), encoding="utf-8")
@@ -206,6 +234,8 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
             print(json.dumps({"build_commands": cls.build_commands,
                               "build_diagnostics": cls.build_diagnostics}))
         cls.fixtures = _fixtures(cls.build_dir)
+        for kind in ("rcbf", "rcbf_multi", "rdbf"):
+            (cls.build_dir / f"reset-expected-{kind}.bin").write_bytes(cls.fixtures[kind][1])
 
     def invoke_fixture(self, kind: str, complete: bool, route: str = "direct",
                        step: int = 4096, *, replacement: str = ""
@@ -704,6 +734,153 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
 
     def test_preparation_replacement_code_failure_and_retry(self) -> None:
         self.check_preparation_failure("code", replacement=True)
+
+    def reset_records(self, kind: str, scenario: str, initial: str,
+                      recovery: str) -> List[Dict[str, Any]]:
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        expected_payload = self.build_dir / f"reset-expected-{recovery}.bin"
+        result = subprocess.run(
+            [str(self.binary), "reset", kind, scenario, str(self.fixtures[initial][0]),
+             str(self.fixtures[recovery][0]), str(expected_payload),
+             str(self.fixtures["rcbf"][0])], capture_output=True, text=True,
+            check=False, timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"reset_format": kind, "scenario": scenario, "initial": initial,
+                              "recovery": recovery, "stderr": result.stderr, "records": records}))
+        if scenario == "error":
+            expected_error = "Symbol table does not contain measurement start/end" if \
+                kind == "rcbf" else "Mismatch in n_actors"
+            self.assertIn(expected_error, result.stderr)
+            self.assertNotIn("Sanitizer", result.stderr)
+        else:
+            self.assertEqual(result.stderr, "")
+        self.assertEqual(records[0]["event"], "init")
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        return records
+
+    def check_reset_observations(self, records: List[Dict[str, Any]], kind: str,
+                                 scenario: str, recovery: str) -> None:
+        resets = [r for r in records if r["event"] == "reset"]
+        self.assertEqual(len(resets), 3 if scenario == "cycles" else
+                         2 if scenario == "repeated" else 1)
+        for index, record in enumerate(records):
+            if record["event"] not in ("reset", "final_reset"):
+                continue
+            self.assertEqual(record["ret"], 0)
+            self.assertTrue(record["idle_valid"])  # Includes private counts, capacities, aliases.
+            self.assertTrue(record["not_receiving"])
+            self.assertEqual(record["cursor"], 0)
+            self.assertFalse(record["finished"])  # Per-call harness value, not parser validity.
+            self.assertIsNone(record["parser_ret"])
+            self.assertIsNone(record["hash"])
+            self.assertGreater(record["root_bytes"], 0)
+            recreated = scenario == "released" and record is resets[0]
+            self.assertEqual(record["root_preserved"], not recreated)
+            previous = next(r for r in reversed(records[:index]) if "allocation_attempts" in r)
+            self.assertEqual(record["allocation_attempts"],
+                             previous["allocation_attempts"] + int(recreated))
+            if record["format"] == "rcbf":
+                self.assertEqual(record["n_actors"], 0)
+            else:
+                self.assertEqual(record["n_inputs"], 0)
+                self.assertEqual(record["n_actors"], 1 if kind == "rdbf" else
+                                 3 if recovery == "rcbf_multi" else 1)
+        for record in records:
+            if record["event"] in ("feed", "reset", "final_reset"):
+                self.assertFalse(record["tc_ready"])
+                self.assertFalse(record["inputs_ready"])
+                self.assertEqual(record["sandbox_calls"], 0)
+                self.assertEqual(record["code_calls"], 0)
+                self.assertEqual(record["trace_calls"], 0)
+
+    def check_reset_scenario(self, kind: str, scenario: str, *, initial: str = "",
+                             recovery: str = "") -> None:
+        initial = initial or kind
+        recovery = recovery or kind
+        records = self.reset_records(kind, scenario, initial, recovery)
+        self.check_reset_observations(records, kind, scenario, recovery)
+        feeds = [r for r in records if r["event"] == "feed" and r["format"] == kind]
+        recovered = [r for r in feeds if r["upload_id"] == feeds[-1]["upload_id"]]
+        expected_returns = {"rcbf": [16, 48, 96, 24, 36],
+                            "rcbf_multi": [16, 144, 288, 72, 36, 40, 44],
+                            "rdbf": [16, 16, 4096, 4096, 4096]}
+        self.assertEqual([r["ret"] for r in recovered], expected_returns[recovery])
+        for record in recovered:
+            self.assertEqual(record["parser_ret"], record["ret"])
+            self.assertEqual(record["consumed"], record["ret"])
+            self.assertIsNone(record["callback_ret"])
+            self.assertLessEqual(record["ret"], record["requested"])
+        self.assertTrue(any(r["ret"] < r["requested"] for r in recovered))
+        self.assertTrue(all(not r["finished"] and r["receiving"] for r in recovered[:-1]))
+        self.assertTrue(recovered[-1]["finished"])
+        self.assertFalse(recovered[-1]["receiving"])
+        self.assertEqual(recovered[-1]["cursor"], self.fixtures[recovery][2])
+        self.assertEqual(sum(r["consumed"] for r in recovered), self.fixtures[recovery][2])
+        self.assertEqual(recovered[-1]["hash"], _hash(self.fixtures[recovery][1]))
+        self.assertEqual([r for r in records if r["event"] == "payload_comparison"],
+                         [{"event": "payload_comparison", "equal": True,
+                           "bytes": len(self.fixtures[recovery][1])}])
+        if scenario not in ("repeated", "released"):
+            before_reset = [records[i - 1] for i, r in enumerate(records)
+                            if r["event"] == "reset"]
+            for record in before_reset:
+                if scenario == "error":
+                    self.assertLess(record["ret"], 0)
+                    self.assertEqual(record["finished"], kind == "rcbf")
+                else:
+                    self.assertGreater(record["ret"], 0)
+                    self.assertEqual(record["finished"], scenario == "complete")
+                    limit = self.fixtures[initial][2] - (0 if scenario == "complete" else 8)
+                    self.assertEqual(record["cursor"], limit)
+        final_resets = [r for r in records if r["event"] == "final_reset"]
+        self.assertEqual(len(final_resets), 2)
+        self.assertEqual(final_resets[-1]["live_bytes"],
+                         sum(r["root_bytes"] for r in final_resets))
+
+    def test_reset_interrupted_rcbf(self) -> None:
+        self.check_reset_scenario("rcbf", "interrupted")
+
+    def test_reset_interrupted_rdbf(self) -> None:
+        self.check_reset_scenario("rdbf", "interrupted")
+
+    def test_reset_repeated_rcbf(self) -> None:
+        self.check_reset_scenario("rcbf", "repeated")
+
+    def test_reset_repeated_rdbf(self) -> None:
+        self.check_reset_scenario("rdbf", "repeated")
+
+    def test_reset_completed_rcbf(self) -> None:
+        self.check_reset_scenario("rcbf", "complete", initial="rcbf_multi")
+
+    def test_reset_completed_rdbf(self) -> None:
+        self.check_reset_scenario("rdbf", "complete", initial="rdbf_paged")
+
+    def test_reset_rcbf_semantic_failure(self) -> None:
+        self.check_reset_scenario("rcbf", "error", initial="rcbf_missing_end")
+
+    def test_reset_rdbf_actor_mismatch(self) -> None:
+        self.check_reset_scenario("rdbf", "error", initial="rdbf_wrong_actor")
+
+    def test_reset_consecutive_interrupted_rcbf(self) -> None:
+        self.check_reset_scenario("rcbf", "cycles", initial="rcbf_multi")
+
+    def test_reset_consecutive_interrupted_rdbf(self) -> None:
+        self.check_reset_scenario("rdbf", "cycles", initial="rdbf_paged")
+
+    def test_reset_recovery_to_multi_actor_rcbf(self) -> None:
+        self.check_reset_scenario("rcbf", "interrupted", recovery="rcbf_multi")
+
+    def test_reset_interrupted_later_rcbf_section(self) -> None:
+        self.check_reset_scenario("rcbf", "interrupted", initial="rcbf_multi")
+
+    def test_reset_recreates_released_rcbf_root(self) -> None:
+        self.check_reset_scenario("rcbf", "released")
+
+    def test_reset_recreates_released_rdbf_root(self) -> None:
+        self.check_reset_scenario("rdbf", "released")
 
     def test_store_complete_rcbf(self) -> None:
         feeds = self.run_fixture("rcbf", True, route="store")

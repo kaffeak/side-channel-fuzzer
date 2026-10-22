@@ -195,6 +195,23 @@ int init_input_parser(void)
     return 0;
 }
 
+int reset_input_parser(void)
+{
+    // n_actors belongs to the test-case parser and remains the required parent.
+    if (inputs)
+        memset(inputs, 0, sizeof(*inputs));
+    is_receiving_inputs = false;
+    cursor = 0;
+    n_inputs = 0;
+    highest_n_actors = 0;
+    highest_n_inputs = 0;
+    SAFE_FREE(allocated_metadata);
+    SAFE_VFREE(allocated_data);
+    if (!inputs)
+        inputs = CHECKED_ZALLOC(sizeof(*inputs));
+    return 0;
+}
+
 void free_input_parser(void)
 {
     SAFE_FREE(inputs);

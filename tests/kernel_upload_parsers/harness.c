@@ -25,6 +25,7 @@ static bool ready_before_call, ready_at_parser_entry;
 static bool last_parser_called, inputs_at_parser_entry;
 static int next_at_parser_entry;
 static int sandbox_result, code_result, last_sandbox_ret, last_code_ret;
+static bool reset_root_preserved;
 
 /* Storage for the actual callback's globals, with the production initial values. */
 bool tc_ready = false;
@@ -37,6 +38,8 @@ static size_t trace_calls;
 
 uint64_t host_tc_cursor(void);
 uint64_t host_input_cursor(void);
+bool host_tc_idle(void);
+bool host_input_idle(void);
 ssize_t host_test_case_store(const char *buf, size_t count);
 ssize_t host_inputs_store(const char *buf, size_t count);
 ssize_t host_trace_show(char *buf);
@@ -220,6 +223,11 @@ static void emit(const char *event, size_t requested, ssize_t ret)
         }
     }
     if (have_hash) printf("\"%016llx\"", hash); else printf("null");
+    if (!strcmp(event, "reset") || !strcmp(event, "final_reset"))
+        printf(",\"idle_valid\":%s,\"root_preserved\":%s,\"root_bytes\":%zu",
+               (use_inputs ? host_input_idle() : host_tc_idle()) ? "true" : "false",
+               reset_root_preserved ? "true" : "false",
+               allocation_size(use_inputs ? (void *)inputs : (void *)test_case));
     puts("}");
     fflush(stdout); /* Preserve preceding observations if the next call trips ASan. */
 }
@@ -500,12 +508,120 @@ static int preparation_failure_scenario(int argc, char **argv)
     return live_bytes ? 66 : 0;
 }
 
+static void reset_parser(const char *event)
+{
+    void *root = use_inputs ? (void *)inputs : (void *)test_case;
+    int ret = use_inputs ? reset_input_parser() : reset_test_case_parser();
+    reset_root_preserved = root && root == (use_inputs ? (void *)inputs : (void *)test_case);
+    // These are harness per-call observations, not persistent parser completion state.
+    last_finished = false;
+    last_parser_called = false;
+    last_parser_ret = 0;
+    emit(event, 0, ret);
+    if (ret) fatal("explicit parser reset failed");
+}
+
+static void reset_upload(const char *path, bool input, bool incomplete)
+{
+    char data[MAX_FILE];
+    size_t length = read_fixture(path, data);
+    if (length < 16) fatal("reset fixture lacks a complete header");
+    size_t remaining = incomplete ? length - 8 : length;
+    size_t offset = 0;
+    use_inputs = input;
+    use_store = false; // Call actual parsers directly, never change callback admission.
+    while (remaining) {
+        size_t requested = remaining < PAGE_SIZE ? remaining : PAGE_SIZE;
+        ssize_t ret = feed(data + offset, requested);
+        if (ret < 0) break;
+        if (!ret || (size_t)ret > requested) fatal("invalid reset upload consumption");
+        offset += (size_t)ret;
+        remaining -= (size_t)ret;
+    }
+    upload_id++;
+}
+
+static void compare_reset_payload(const char *path)
+{
+    char expected[MAX_FILE];
+    size_t length = read_fixture(path, expected), offset = 0;
+    if (!last_finished || last_parser_ret < 0) fatal("cannot inspect incomplete/invalid payload");
+    if (use_inputs) {
+        if (!tracked(inputs, sizeof(*inputs)) || inputs->data_size != length ||
+            !tracked(inputs->data, length))
+            fatal("input comparison exceeds tracked allocation");
+        if (memcmp(inputs->data, expected, length)) fatal("recovered input bytes differ");
+    } else {
+        if (!tracked(test_case, sizeof(*test_case)) || !n_actors || n_actors > 4 ||
+            !tracked(test_case->metadata, n_actors * sizeof(*test_case->metadata)) ||
+            !tracked(test_case->sections, n_actors * sizeof(*test_case->sections)))
+            fatal("section comparison exceeds tracked allocation");
+        for (size_t i = 0; i < n_actors; i++) {
+            size_t size = test_case->metadata[i].size;
+            size_t section_offset = i * sizeof(*test_case->sections) + offsetof(tc_section_t, code);
+            if (offset > length || size > length - offset ||
+                size > sizeof(test_case->sections[i].code) ||
+                !tracked_range(test_case->sections, section_offset, size))
+                fatal("section comparison exceeds fixture/allocation");
+            if (memcmp((char *)test_case->sections + section_offset, expected + offset, size))
+                fatal("recovered code bytes differ");
+            offset += size;
+        }
+        if (offset != length) fatal("recovered code length differs");
+    }
+    printf("{\"event\":\"payload_comparison\",\"bytes\":%zu,\"equal\":true}\n", length);
+}
+
+static int reset_scenario(int argc, char **argv)
+{
+    if (argc != 8 || (strcmp(argv[2], "rcbf") && strcmp(argv[2], "rdbf")))
+        fatal("usage: harness reset rcbf|rdbf SCENARIO INITIAL RECOVERY EXPECTED_PAYLOAD PARENT_RCBF");
+    const char *scenario = argv[3];
+    bool input = !strcmp(argv[2], "rdbf");
+    bool repeated = !strcmp(scenario, "repeated");
+    bool complete = !strcmp(scenario, "complete");
+    bool error = !strcmp(scenario, "error");
+    bool cycles = !strcmp(scenario, "cycles");
+    bool released = !strcmp(scenario, "released");
+    if (!(repeated || complete || error || cycles || released || !strcmp(scenario, "interrupted")))
+        fatal("unknown bounded reset scenario");
+    if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
+    use_inputs = input;
+    emit("init", 0, 0);
+    if (input) reset_upload(argv[7], false, false); // Real parsed parent, not a fabricated actor count.
+    use_inputs = input;
+    if (released) {
+        if (input) free_input_parser(); else free_test_case_parser();
+        reset_parser("reset");
+    } else if (repeated) {
+        reset_parser("reset");
+        reset_parser("reset");
+    } else {
+        for (size_t i = 0; i < (cycles ? 3U : 1U); i++) {
+            reset_upload(argv[4], input, !complete && !error);
+            reset_parser("reset");
+        }
+    }
+    reset_upload(argv[5], input, false);
+    compare_reset_payload(argv[6]); // Exact bytes, independent of the diagnostic hash.
+    // Retire both parsers explicitly: only their empty root objects should remain.
+    use_inputs = true;
+    reset_parser("final_reset");
+    use_inputs = false;
+    reset_parser("final_reset");
+    free_input_parser();
+    free_test_case_parser();
+    printf("{\"event\":\"teardown\",\"live_bytes\":%zu}\n", live_bytes);
+    return live_bytes ? 66 : 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "prepare")) return preparation_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "recover")) return recovery_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "failure")) return preparation_failure_scenario(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "reset")) return reset_scenario(argc, argv);
     if ((argc != 6 && argc != 7) || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
         (strcmp(argv[2], "direct") && strcmp(argv[2], "store")))
         fatal("usage: harness rcbf|rdbf direct|store FIXTURE PREFIX_BYTES STEP_BYTES [REPLACEMENT]");

@@ -61,6 +61,13 @@ extern test_case_t *test_case;
 ssize_t parse_test_case_buffer(const char *buf, size_t count, bool *finished);
 bool tc_parsing_completed(void);
 int init_test_case_parser(void);
+// Explicit destructive stream reset, not readiness publication or sandbox cleanup.
+// Caller must exclude all parser/resource consumers and invalidate preparation.
+// Success: idle, zero counts/sizes/features, no payload buffers/aliases/capacities,
+// and a nonnull empty root. Retains an existing root; may allocate one if absent.
+// On -ENOMEM the stream is retired but the root is NULL: do not parse until a
+// reset succeeds. Repeated resets are safe. Does not reset the input parser.
+int reset_test_case_parser(void);
 void free_test_case_parser(void);
 
 #endif // _TEST_CASE_PARSER_H_

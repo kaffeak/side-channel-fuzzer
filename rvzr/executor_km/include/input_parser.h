@@ -44,6 +44,13 @@ ssize_t parse_input_buffer(const char *buf, size_t count, bool *finished);
 bool input_parsing_completed(void);
 
 int init_input_parser(void);
+// Explicit destructive stream reset, not readiness publication or sandbox cleanup.
+// Caller must exclude consumers and invalidate input readiness before calling.
+// Success: idle, zero cursor/input count/sizes/capacities, no payload buffers or
+// aliases, and a nonnull empty root. Preserves the test-case-owned n_actors.
+// Retains an existing root; if allocation of an absent root fails, returns
+// -ENOMEM with the stream retired. Do not parse until reset succeeds.
+int reset_input_parser(void);
 void free_input_parser(void);
 
 #endif // _INPUT_PARSER_H_

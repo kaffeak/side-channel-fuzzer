@@ -29,6 +29,10 @@ static actor_metadata_t *_allocated_actor_table;
 static tc_symbol_entry_t *_allocated_symbol_table;
 static tc_section_metadata_entry_t *_allocated_metadata;
 static tc_section_t *_allocated_data;
+// File-private rather than function-static so an explicit reset can retire a stream.
+static size_t curr_section_id;
+static size_t curr_section_start;
+static size_t curr_section_end;
 
 /// @brief Initialize the state machine
 /// @param buf A pointer to the buffer containing (a portion of) the test case
@@ -190,9 +194,6 @@ ssize_t parse_test_case_buffer(const char *buf, size_t count, bool *finished)
 {
     ASSERT(*finished == false, "parse_test_case_buffer");
 
-    static size_t curr_section_id = 0;
-    static size_t curr_section_start = 0;
-    static size_t curr_section_end = 0;
     ssize_t consumed_bytes = 0;
     ssize_t byte_id = 0;
 
@@ -350,6 +351,31 @@ int init_test_case_parser(void)
         return -ENOMEM;
     }
     actors = test_case->actor_table;
+    return 0;
+}
+
+int reset_test_case_parser(void)
+{
+    // Withdraw parser aliases before releasing their backing allocations. Keep a
+    // zeroed root: parse_test_case_buffer reads its sizes even on the header call.
+    actors = NULL;
+    if (test_case)
+        memset(test_case, 0, sizeof(*test_case));
+    _is_receiving_test_case = false;
+    _cursor = 0;
+    curr_section_id = 0;
+    curr_section_start = 0;
+    curr_section_end = 0;
+    n_actors = 0;
+    n_symbols = 0;
+    highest_n_actors = 0;
+    highest_n_symbols = 0;
+    SAFE_FREE(_allocated_actor_table);
+    SAFE_FREE(_allocated_symbol_table);
+    SAFE_FREE(_allocated_metadata);
+    SAFE_VFREE(_allocated_data);
+    if (!test_case)
+        test_case = CHECKED_ZALLOC(sizeof(*test_case));
     return 0;
 }
 
