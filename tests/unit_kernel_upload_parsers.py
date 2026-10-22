@@ -132,6 +132,12 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
     fixtures: Dict[str, Tuple[Path, bytes, int]]
     build_commands: List[List[str]]
     build_diagnostics: str
+    _recovery_safety_records: List[Dict[str, Any]]
+
+    def setUp(self) -> None:
+        if self._testMethodName == "test_recovery_interrupted_rdbf_safety_invariant":
+            # setUp failures are NOT expected failures: never hide sanitizer/process/JSON errors.
+            _, self._recovery_safety_records = self.recovery_records("rdbf-interrupted")
 
     @classmethod
     def setUpClass(cls) -> None:  # pylint: disable=too-many-locals
@@ -283,7 +289,7 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
         return result.stderr, records[:-1]
 
     def check_rejected_trace(self, record: Dict[str, Any], trace_calls: int,
-                             *, inputs_completed: bool = True) -> None:
+                             *, inputs_completed: bool = True, tc_completed: bool = True) -> None:
         self.assertEqual(record["ret"], -errno.EIO)
         self.assertEqual(record["trace_calls"], trace_calls)
         self.assertTrue(record["buffer_unchanged"])
@@ -291,7 +297,7 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
         self.assertEqual(record["unfinished_before"], record["unfinished_after"])
         self.assertEqual(record["next_before"], record["next_after"])
         # Completion predicates are checked separately from validated readiness.
-        self.assertTrue(record["tc_completed"])
+        self.assertEqual(record["tc_completed"], tc_completed)
         self.assertEqual(record["inputs_completed"], inputs_completed)
 
     def test_trace_rejects_unready_execution(self) -> None:
@@ -508,6 +514,110 @@ class KernelUploadParserBaselineTest(unittest.TestCase):  # pylint: disable=too-
         self.assertTrue(feeds[0]["ready_before_call"])
         self.assertTrue(feeds[-1]["inputs_ready"])
         self.check_fresh_single_trace(traces[1], calls=2)
+
+    def recovery_records(self, scenario: str) -> Tuple[str, List[Dict[str, Any]]]:
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        paths = [self.fixtures[key][0] for key in ("rcbf", "rdbf", "rdbf_wrong_actor")]
+        result = subprocess.run([str(self.binary), "recover", scenario] + list(map(str, paths)),
+                                capture_output=True, text=True, check=False,
+                                timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(records[0]["event"], "init")
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"recover": scenario, "records": records, "stderr": result.stderr}))
+        return result.stderr, records[1:-1]
+
+    def test_recovery_legacy_risk_interrupted_rdbf_header_completes_old_batch(self) -> None:
+        # Evidence of a defect, not a specification that this retry or admission is safe.
+        stderr, records = self.recovery_records("rdbf-interrupted")
+        self.assertEqual(stderr.count("Assertion failed: tc_ready && inputs_ready"), 1)
+        partial = self.check_input_upload(records, 1, [16, 16, 4096, 4096, 4088])
+        self.assertEqual(partial[-1]["cursor"], 12312)
+        self.assertTrue(partial[-1]["receiving"])
+        self.assertFalse(partial[-1]["inputs_ready"])
+        retry = self.check_input_upload(records, 2, [8])[0]
+        self.assertEqual(retry["requested"], 16)
+        self.assertEqual(retry["cursor"], 12320)
+        self.assertTrue(retry["finished"])
+        self.assertFalse(retry["receiving"])
+        self.assertTrue(retry["inputs_ready"])
+        # Independent bytes: the old payload's missing tail was replaced by a new actor-count word.
+        mixed = self.fixtures["rdbf"][1][:-8] + self.fixtures["rdbf"][0].read_bytes()[:8]
+        self.assertEqual(retry["hash"], _hash(mixed))
+        self.assertNotEqual(retry["hash"], _hash(self.fixtures["rdbf"][1]))
+        self.assertEqual(retry["allocation_attempts"], partial[-1]["allocation_attempts"])
+        self.assertEqual(retry["sandbox_calls"], 1)
+        self.assertEqual(retry["code_calls"], 1)
+        self.assertEqual(retry["trace_calls"], 0)
+        traces = [r for r in records if r["event"] == "trace"]
+        self.check_rejected_trace(traces[0], trace_calls=0, inputs_completed=False)
+        self.assertEqual(traces[1]["ret"], 17)  # The actual callback admits the mixed batch.
+        self.assertEqual(traces[1]["trace_calls"], 1)
+
+    @unittest.expectedFailure
+    def test_recovery_interrupted_rdbf_safety_invariant(self) -> None:
+        # Pending production correction: process/sanitizer validation ran in setUp, outside
+        # expectedFailure. Only the known admission safety assertions may fail here.
+        records = self._recovery_safety_records
+        retry = [r for r in records if r["event"] == "feed" and r["upload_id"] == 2]
+        self.assertFalse(retry[-1]["inputs_ready"], "Retry must not validate mixed old/new bytes")
+        self.assertEqual(records[-1]["ret"], -errno.EIO)
+        self.assertEqual(records[-1]["trace_calls"], 0)
+        self.assertTrue(records[-1]["buffer_unchanged"])
+
+    def test_recovery_valid_rdbf_after_actor_mismatch(self) -> None:
+        stderr, records = self.recovery_records("rdbf-error")
+        self.assertIn("Mismatch in n_actors", stderr)
+        error = self.check_input_upload(records, 1, [-1])[0]
+        self.assertEqual(error["requested"], 16)
+        self.assertEqual(error["cursor"], (1 << 64) - errno.EIO)
+        self.assertFalse(error["finished"])
+        self.assertFalse(error["receiving"])
+        self.assertFalse(error["inputs_ready"])
+        self.assertIsNone(error["hash"])
+        retry = self.check_input_upload(records, 2, [16, 16, 4096, 4096, 4096])
+        self.assertEqual(retry[0]["cursor"], 16)
+        self.assertTrue(retry[0]["receiving"])
+        self.assertEqual(retry[-1]["cursor"], 12320)
+        self.assertTrue(retry[-1]["finished"])
+        self.assertTrue(retry[-1]["inputs_ready"])
+        self.assertEqual(retry[-1]["hash"], _hash(self.fixtures["rdbf"][1]))
+        for record in retry:
+            self.assertEqual(record["sandbox_calls"], 1)
+            self.assertEqual(record["code_calls"], 1)
+            self.assertEqual(record["trace_calls"], 0)
+        traces = [r for r in records if r["event"] == "trace"]
+        self.check_rejected_trace(traces[0], trace_calls=0)
+        self.check_fresh_single_trace(traces[1], calls=1)
+
+    def test_recovery_interrupted_rcbf_retry_is_not_a_new_header(self) -> None:
+        stderr, records = self.recovery_records("rcbf-interrupted")
+        self.assertIn("consumed_bytes (8) != count (16)", stderr)
+        feeds = [r for r in records if r["event"] == "feed"]
+        self.assertEqual([r["parser_ret"] for r in feeds], [16, 48, 96, 24, 28, -errno.EIO])
+        self.assertEqual([r["callback_ret"] for r in feeds], [r["parser_ret"] for r in feeds])
+        partial, retry = feeds[-2:]
+        self.assertEqual(partial["cursor"], 212)
+        self.assertTrue(partial["receiving"])
+        self.assertEqual(retry["requested"], 16)
+        self.assertEqual(retry["cursor"], 220)
+        self.assertTrue(retry["finished"])
+        self.assertFalse(retry["receiving"])
+        self.assertIsNone(retry["consumed"])
+        self.assertIsNone(retry["hash"])
+        self.assertEqual(retry["allocation_attempts"], partial["allocation_attempts"])
+        for record in feeds:
+            self.assertFalse(record["tc_ready"])
+            self.assertFalse(record["inputs_ready"])
+            self.assertEqual(record["sandbox_calls"], 0)
+            self.assertEqual(record["code_calls"], 0)
+            self.assertEqual(record["trace_calls"], 0)
+        traces = [r for r in records if r["event"] == "trace"]
+        self.check_rejected_trace(traces[0], trace_calls=0, tc_completed=False)
+        self.check_rejected_trace(traces[1], trace_calls=0)
 
     def test_store_complete_rcbf(self) -> None:
         feeds = self.run_fixture("rcbf", True, route="store")

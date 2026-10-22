@@ -168,11 +168,11 @@ static void emit(const char *event, size_t requested, ssize_t ret)
     printf(",\"parser_calls\":%zu,\"callback_ret\":", parser_calls);
     if (use_store && !strcmp(event, "feed")) printf("%zd", ret); else printf("null");
     printf(",\"tc_ready\":%s,\"inputs_ready\":%s,\"format\":\"%s\","
-           "\"sandbox_calls\":%zu,\"code_calls\":%zu,"
+           "\"sandbox_calls\":%zu,\"code_calls\":%zu,\"trace_calls\":%zu,"
            "\"next_measurement_id\":%d,\"upload_id\":%zu,\"ready_before_call\":%s,"
            "\"ready_at_parser_entry\":",
            tc_ready ? "true" : "false", inputs_ready ? "true" : "false",
-           use_inputs ? "rdbf" : "rcbf", sandbox_calls, code_calls, next_measurement_id,
+           use_inputs ? "rdbf" : "rcbf", sandbox_calls, code_calls, trace_calls, next_measurement_id,
            upload_id, ready_before_call ? "true" : "false");
     if (use_store && last_parser_called)
         printf("%s", ready_at_parser_entry ? "true" : "false");
@@ -411,10 +411,59 @@ static int preparation_scenario(int argc, char **argv)
     return live_bytes ? 66 : 0;
 }
 
+static void upload_header(const char *path, bool input)
+{
+    char header[16];
+    FILE *file = fopen(path, "rb");
+    if (!file) fatal("cannot open retry fixture");
+    if (fread(header, 1, sizeof(header), file) != sizeof(header) || ferror(file))
+        fatal("retry fixture lacks a complete header");
+    fclose(file);
+    use_inputs = input;
+    use_store = true;
+    /* Observe only this response: do not reinterpret unconsumed retry bytes as a new header. */
+    (void)feed(header, sizeof(header));
+    upload_id++;
+}
+
+static int recovery_scenario(int argc, char **argv)
+{
+    if (argc != 6) fatal("usage: harness recover SCENARIO RCBF RDBF WRONG_ACTOR_RDBF");
+    bool tc = !strcmp(argv[2], "rcbf-interrupted");
+    bool error = !strcmp(argv[2], "rdbf-error");
+    if (!tc && !error && strcmp(argv[2], "rdbf-interrupted"))
+        fatal("unknown bounded recovery scenario");
+    if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
+    measurements = owned_measurements;
+    emit("init", 0, 0);
+    if (tc) {
+        upload_fixture(argv[3], false, true);
+        observe_trace(0);
+        upload_header(argv[3], false);
+    } else {
+        upload_fixture(argv[3], false, false);
+        if (error) {
+            upload_header(argv[5], true);
+            observe_trace(0);
+            upload_fixture(argv[4], true, false);
+        } else {
+            upload_fixture(argv[4], true, true);
+            observe_trace(0);
+            upload_header(argv[4], true);
+        }
+    }
+    observe_trace(1); /* Only the counted host stub can run; never test-case instructions. */
+    free_input_parser();
+    free_test_case_parser();
+    printf("{\"event\":\"teardown\",\"live_bytes\":%zu}\n", live_bytes);
+    return live_bytes ? 66 : 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "prepare")) return preparation_scenario(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "recover")) return recovery_scenario(argc, argv);
     if ((argc != 6 && argc != 7) || (strcmp(argv[1], "rcbf") && strcmp(argv[1], "rdbf")) ||
         (strcmp(argv[2], "direct") && strcmp(argv[2], "store")))
         fatal("usage: harness rcbf|rdbf direct|store FIXTURE PREFIX_BYTES STEP_BYTES [REPLACEMENT]");

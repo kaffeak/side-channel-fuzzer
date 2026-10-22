@@ -520,3 +520,143 @@ inputs, allocations and result iteration, with synchronization between publicati
 trace admission and execution. Shared globals are still unlocked, and simultaneous
 callbacks can race; these sequential tests cannot establish atomicity. No loaded-
 kernel, M3 or 16 KB runtime claim follows from this change.
+
+## B3.3c.4a interrupted uploads and parser-error recovery
+
+This stage changes **only host tests and documentation**. The three fixed recovery
+scenarios reuse the production parsers and extracted upload/trace callbacks. The
+same process retains its actual parser state throughout a scenario; no driver
+sets readiness, resets a parser, or loads/executes code. The only measurement
+function is the counted host stub. All existing size/call/time limits remain.
+
+```text
+parser-baseline recover rdbf-interrupted|rdbf-error|rcbf-interrupted RCBF RDBF WRONG_ACTOR_RDBF
+```
+
+### Source state and upload boundaries
+
+`input_parser.c:21-27` retains receiving, cursor, allocation high-water counts
+and backing allocations. Batch start resets cursor and replaces the batch object
+(`:31-40`); successful completion clears receiving but leaves the end cursor and
+backing allocations (`:133-143`). Initial setup and teardown are at `:183-203`.
+
+`test_case_parser.c:24-32` retains receiving, cursor, sizes and allocations;
+`:193-195` also retains three function-local static section variables. Successful
+completion resets those section variables and clears receiving before final
+validation (`:283-296`); the end cursor remains until the next batch start. Header
+and oversized-section errors do not perform a uniform complete-state reset.
+Initialization (`:336-353`) does not reset the function-local section variables
+or all allocation high-water counts, and cleanup (`:356-363`) frees resources
+rather than providing a stream abort. Calling free/init is not an established
+in-process recovery API.
+
+Neither parser clears receiving merely because the sender stops writing. Their
+only new-header discriminator is `!receiving`. The upload callbacks receive
+buffers/counts, not an upload identity or file-open boundary. There is no exposed
+parser abort/reset operation (`main.c:694-695,764-765` calls init/free for module
+lifetime). RCBF/RDBF serializers open and close their paths for each upload;
+`Executor.load_test_case()` / `trace_test_case()` invoke them at
+`rvzr/executor.py:275,308`. Closing and reopening does not reset this parser state.
+
+### Bounded retry method and observed results
+
+For interrupted streams, the first upload stops eight bytes before its payload
+ends. The retry is a header-first attempt using the first **16 actual bytes** of
+the corresponding valid serialized fixture. The driver observes that one response
+and stops: it does not discard a short return, resubmit the remaining eight bytes
+as an incomplete new header, or claim the whole fresh file was processed. This
+keeps the boundary ambiguity visible without launching additional parsing or
+allocation scenarios. Error recovery instead supplies the mismatch fixture's
+16-byte header, then attempts the complete valid one-actor RDBF stream.
+
+| Scenario | State before retry | Retry parser / callback returns | State after retry | Preparation allocate/load calls | Measurement calls before/after final trace |
+| --- | --- | --- | --- | --- | --- |
+| Interrupted RDBF | cursor 12312, receiving true, inputs unready | **8 / 8**, from 16 supplied bytes | cursor 12320, finished true, receiving false, **inputs ready** | 1 / 1, from initial RCBF only | **0 / 1** |
+| RDBF actor mismatch | error -1, cursor 18446744073709551611, receiving false, inputs unready | 16, 16, 4096, 4096, 4096; callback equals parser each time | header resets cursor to 16; final cursor 12320, inputs ready | 1 / 1, from initial RCBF only | 0 / 1, after successful recovery |
+| Interrupted RCBF | cursor 212, receiving true, code unready | **-EIO / -EIO**, from 16 supplied bytes | cursor 220, finished true, receiving false; both readiness flags false | **0 / 0** | **0 / 0** |
+
+Interrupted RDBF **does not restart**: the parser copies the new header's first
+eight bytes into the old payload tail and marks that old batch complete.
+The callback then publishes input readiness. The independently bounded payload
+digest equals `old_payload[:-8] + new_header[:8]` and differs from the valid input
+digest. This confirms mixed old/new data, not just a readiness-flag observation.
+The first trace before retry is rejected, but the trace after this unsuccessful
+restart is admitted and calls the measurement stub. This is a functional safety
+defect; no hardware instructions or real measurement run.
+
+Interrupted RCBF likewise treats the new header as old section data. After eight
+bytes it finishes the old section, then its `consumed_bytes == count` assertion
+fails (`test_case_parser.c:295-296`). The actual parser returns -EIO with
+`finished=true`; the corrected callback propagates that error without preparing
+code. Both trace attempts are rejected and no measurement stub runs. This is
+safe rejection of the **tested 16-byte retry**, not recognition of a new stream
+or a guarantee for other chunk boundaries. Another full retry after this error
+was not tested, although the receiving predicate is now idle.
+
+### Why the cursor wraps, and why this header-error retry succeeds
+
+The actor-count assertion in `start_batch_input_parsing()` returns -EIO (-5).
+That routine had just set unsigned cursor to zero. `parse_input_buffer()` adds
+the negative result to cursor **before** checking it (`input_parser.c:100-103`),
+yielding `2^64 - 5`, then returns -1. The receiving flag is still false: the
+assignment to true at line 105 was not reached. On the next valid header, the
+batch-start routine is entered again and resets cursor to zero before consuming
+16 bytes. The subsequent valid batch completes byte-for-byte correctly, restores
+input readiness, and its trace is admitted. No explicit reset was needed for
+this specific failure/retry sequence. The wrapped value is not used as an index
+on that path. Other error locations and allocation failures are not covered.
+
+The arithmetic wrap is defined unsigned behavior, so a clean UBSan run does not
+make it a sensible parser-state policy. Checking the batch-start return before
+adding it would remove that dirty cursor, but would **not** solve interrupted-
+stream ambiguity. No production correction is implemented here.
+
+### Tests, evidence and the unfulfilled safety requirement
+
+Three passing characterization tests record the outcomes above, including exact
+returns, cursors, completion/receiving state, readiness, payload digest and counted
+preparation/measurement calls. The RDBF defect test is explicitly named
+`test_recovery_legacy_risk_interrupted_rdbf_header_completes_old_batch`; it does
+not declare false admission acceptable.
+
+`test_recovery_interrupted_rdbf_safety_invariant` asserts the desired invariant:
+no mixed-data readiness, trace rejection and zero measurement calls. It is an
+explicit **expected failure** until recovery is corrected. Its subprocess,
+timeout, JSON and teardown checks run in `setUp`, outside unittest's expected-
+failure scope, so an ASan/UBSan abort or process failure is a real test failure.
+The ordinary characterization independently checks the full observed behavior.
+Future recovery work must update the legacy expectation and remove the expected-
+failure marker; a newly passing invariant otherwise produces an unexpected-success
+failure, making the pending requirement visible.
+
+Ordinary, separate ASan and separate UBSan runs each report **29 tests: 28 passed
+and 1 expected failure**. No sanitizer diagnostic appeared. All 102 existing
+input-format, descriptor, preparation, coverage and resource-lifetime regressions
+passed, as did Flake8, strict mypy, Pylint and `git diff --check`. The existing
+LeakSanitizer environment limitation remains. Diagnostic code never indexes memory
+with a parser cursor; digest reads check actual tracked allocations. No source
+fix, new kernel ABI, CI change, allocation-failure injection or loaded-kernel
+experiment is part of this stage.
+
+### Smallest deterministic recovery design and B3.3d requirements
+
+The existing byte stream cannot distinguish an abandoned upload's continuation
+from a fresh upload starting with the same bytes. Resetting on every write would
+break valid multiwrite parsing; scanning for plausible headers would interpret
+ordinary payload as control. Existing callbacks alone cannot infer sender intent.
+
+The minimal protocol addition is an **explicit abort/begin boundary before a
+fresh retry**, with its eventual transport/ABI still to be designed. Reset must
+cover receiving, cursor, section indices/bounds and partial semantic state for
+the selected parser; invalidate dependent readiness and result pagination; and
+leave resource ownership safe for a new batch. It must not assume current
+init/free functions provide that reset. Allocation-failure cleanup still needs
+separate characterization before a failure-safe implementation is specified.
+
+B3.3d should bind begin, continuation, completion and abort to a preparation
+generation, reject late chunks from an older attempt, prevent aborted/failed
+attempts from publishing readiness, and bind inputs/results to their completed
+test-case generation. Trace admission and pagination must enforce the same
+identity under synchronization. A generation descriptor alone does not delimit
+streams or make shared globals atomic. Endpoint names, ownership and locking are
+not implemented by this characterization stage.
