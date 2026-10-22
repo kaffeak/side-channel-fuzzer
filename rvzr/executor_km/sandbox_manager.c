@@ -15,18 +15,35 @@
 #include "page_tables_guest.h"
 #include "page_tables_host.h"
 
-sandbox_t *sandbox = NULL; // global
+sandbox_t *sandbox = NULL; // Owns descriptor; its members are borrowed aliases.
 
-// Util+Data allocation state (alloc_pages + vmap)
+// Private ownership only: not readiness, retry policy or a synchronized snapshot.
 static struct {
-    void *vaddr_unaligned;    // vmap'd virtual address (unaligned)
-    void *vaddr_aligned;      // aligned to 2-page boundary
-    struct page **page_array; // array of page pointers for vmap
-    int num_pages;            // number of pages allocated
-} util_data = {NULL, NULL, NULL, 0};
+    struct page *backing_head; // owns the original order-sized alloc_pages block
+    int backing_order;        // valid only while backing_head is nonnull
+    struct page **page_array; // owns array, whose entries borrow from the block
+    int num_pages;            // initialized array entries, not backing-block size
+    void *vaddr_unaligned;    // owns original vmap mapping of num_pages pages
+    void *vaddr_aligned;      // borrowed interior alias, aligned to 8KB
+    size_t usable_size;       // mapped bytes remaining after the alignment prefix
+    size_t actor_capacity;    // whole actor_data_t records after sizeof(util_t)
+} util_data;
 
-static void *code = NULL;
-static size_t old_x_size = 0;
+enum code_permission_request {
+    CODE_PERMISSION_NOT_REQUESTED,
+    CODE_PERMISSION_X,
+    CODE_PERMISSION_NX,
+};
+
+static struct {
+    void *base;               // owns vmalloc object; public code aliases borrow it
+    size_t size;              // acquired object bytes, excluding allocator padding
+    size_t actor_capacity;    // whole actor_code_t records in the object
+    size_t permission_pages;  // extent passed to existing X/NX calls
+    // Last completed call only, not verified current permissions; retained on free.
+    enum code_permission_request last_permission_request;
+    int last_permission_result; // meaningful only when request != NOT_REQUESTED
+} code_data;
 
 /// @brief Free util_data allocation (vmap + physical pages)
 static void safe_free_util_data(void)
@@ -35,21 +52,31 @@ static void safe_free_util_data(void)
         vunmap(util_data.vaddr_unaligned);
         util_data.vaddr_unaligned = NULL;
         util_data.vaddr_aligned = NULL;
+        util_data.usable_size = 0;
+        util_data.actor_capacity = 0;
     }
     if (util_data.page_array) {
         int order = get_order(util_data.num_pages * PAGE_SIZE);
         __free_pages(util_data.page_array[0], order);
+        util_data.backing_head = NULL;
+        util_data.backing_order = 0;
         kfree(util_data.page_array);
         util_data.page_array = NULL;
+        util_data.num_pages = 0;
     }
 }
 
 /// @brief Free code allocation (vmalloc)
 static void safe_free_code(void)
 {
-    if (code) {
-        set_memory_nx((unsigned long)code, old_x_size);
-        SAFE_VFREE(code);
+    if (code_data.base) {
+        code_data.last_permission_result =
+            set_memory_nx((unsigned long)code_data.base, code_data.permission_pages);
+        code_data.last_permission_request = CODE_PERMISSION_NX;
+        SAFE_VFREE(code_data.base);
+        code_data.size = 0;
+        code_data.actor_capacity = 0;
+        code_data.permission_pages = 0;
         loaded_test_case_entry = NULL;
     }
 }
@@ -62,9 +89,9 @@ static int init_sandbox_pointers(void)
         sandbox = CHECKED_MALLOC(sizeof(sandbox_t));
     }
     sandbox->data = (actor_data_t *)((unsigned long)util_data.vaddr_aligned + sizeof(util_t));
-    sandbox->code = (actor_code_t *)code;
+    sandbox->code = (actor_code_t *)code_data.base;
     sandbox->util = (util_t *)util_data.vaddr_aligned;
-    loaded_test_case_entry = code;
+    loaded_test_case_entry = code_data.base;
     return 0;
 }
 
@@ -91,7 +118,7 @@ static int allocate_util_and_data(size_t n_actors)
     const size_t data_mem_size = n_actors * sizeof(actor_data_t);
     const size_t mem_size = util_mem_size + data_mem_size;
     size_t alloc_size = mem_size + 0x1000; // add 4KB to ensure we can align to 8KB boundary
-    util_data.num_pages = (alloc_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    int num_pages = (alloc_size + PAGE_SIZE - 1) / PAGE_SIZE;
     int order = get_order(alloc_size);
 
     // allocate physical pages
@@ -100,25 +127,33 @@ static int allocate_util_and_data(size_t n_actors)
         PRINT_ERR("Error allocating util_and_data pages\n");
         return -ENOMEM;
     }
+    util_data.backing_head = page;
+    util_data.backing_order = order;
 
     // map the pages into kernel virtual address space
-    util_data.page_array = kmalloc(util_data.num_pages * sizeof(struct page *), GFP_KERNEL);
+    util_data.page_array = kmalloc(num_pages * sizeof(struct page *), GFP_KERNEL);
     if (!util_data.page_array) {
         __free_pages(page, order);
+        util_data.backing_head = NULL;
+        util_data.backing_order = 0;
         PRINT_ERR("Error allocating page array\n");
         return -ENOMEM;
     }
 
-    for (int i = 0; i < util_data.num_pages; i++) {
+    for (int i = 0; i < num_pages; i++) {
         util_data.page_array[i] = page + i;
     }
+    util_data.num_pages = num_pages;
 
     util_data.vaddr_unaligned =
         vmap(util_data.page_array, util_data.num_pages, VM_MAP, PAGE_KERNEL);
     if (!util_data.vaddr_unaligned) {
         kfree(util_data.page_array);
-        __free_pages(page, order);
         util_data.page_array = NULL;
+        util_data.num_pages = 0;
+        __free_pages(page, order);
+        util_data.backing_head = NULL;
+        util_data.backing_order = 0;
         PRINT_ERR("Error mapping util_and_data pages\n");
         return -ENOMEM;
     }
@@ -126,6 +161,12 @@ static int allocate_util_and_data(size_t n_actors)
     // Align to 2-page (8KB) boundary
     unsigned long addr = (unsigned long)util_data.vaddr_unaligned;
     util_data.vaddr_aligned = (void *)ALIGN(addr, 0x2000);
+    size_t mapped_size = (size_t)util_data.num_pages * PAGE_SIZE;
+    size_t prefix = (unsigned long)util_data.vaddr_aligned - addr;
+    util_data.usable_size = prefix <= mapped_size ? mapped_size - prefix : 0;
+    util_data.actor_capacity = util_data.usable_size >= sizeof(util_t)
+                                   ? (util_data.usable_size - sizeof(util_t)) / sizeof(actor_data_t)
+                                   : 0;
 
     return 0;
 }
@@ -140,12 +181,18 @@ static int allocate_code(size_t n_actors)
 {
     safe_free_code();
 
-    code = CHECKED_VMALLOC(n_actors * sizeof(actor_code_t));
+    code_data.base = CHECKED_VMALLOC(n_actors * sizeof(actor_code_t));
+    code_data.size = n_actors * sizeof(actor_code_t);
+    code_data.actor_capacity = code_data.size / sizeof(actor_code_t);
+    code_data.last_permission_request = CODE_PERMISSION_NOT_REQUESTED;
+    code_data.last_permission_result = 0;
     reset_code_area();
 
     size_t code_size = n_actors * sizeof(actor_code_t);
-    old_x_size = DIV_ROUND_UP(code_size, PAGE_SIZE);
-    set_memory_x((unsigned long)code, old_x_size);
+    code_data.permission_pages = DIV_ROUND_UP(code_size, PAGE_SIZE);
+    code_data.last_permission_result =
+        set_memory_x((unsigned long)code_data.base, code_data.permission_pages);
+    code_data.last_permission_request = CODE_PERMISSION_X;
 
     return 0;
 }
@@ -157,17 +204,17 @@ void reset_code_area(void)
 {
     // fill the code area with NOPs
 #if defined(ARCH_X86_64)
-    memset(code, 0x90, sizeof(actor_code_t) * n_actors);
+    memset(code_data.base, 0x90, sizeof(actor_code_t) * n_actors);
 #elif defined(ARCH_ARM)
     for (int i = 0; i < n_actors * sizeof(actor_code_t) / 4; i += 1)
-        ((uint32_t *)code)[i] = 0xd503201f;
+        ((uint32_t *)code_data.base)[i] = 0xd503201f;
 #endif
 
     // initialize the main section with a single ret instruction
 #if defined(ARCH_X86_64)
-    ((uint8_t *)code)[0] = '\xC3';
+    ((uint8_t *)code_data.base)[0] = '\xC3';
 #elif defined(ARCH_ARM)
-    ((uint32_t *)code)[0] = 0xd65f03c0;
+    ((uint32_t *)code_data.base)[0] = 0xd65f03c0;
 #endif
 }
 
