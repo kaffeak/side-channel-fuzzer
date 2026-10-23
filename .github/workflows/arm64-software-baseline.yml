@@ -144,6 +144,14 @@ jobs:
           python -m unittest tests.unit_model_preparation -v
 
 
+      - name: Verify ARM64 contract-model vertical slice
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y binutils
+          python -c "import unicorn; print('Unicorn version:', unicorn.__version__)"
+          python -m unittest tests.unit_arm64_contract_slice -v
+
+
       - name: Characterize model coverage and resource lifetime
         run: |
           python -m unittest \
@@ -184,17 +192,17 @@ jobs:
 
       - name: Verify PTE recovery error propagation
         run: python -m unittest -f tests.unit_pte_recovery_errors -v
-              
+
       - name: Verify PTE recovery errors with AddressSanitizer
         run: |
           RVZR_PARSER_SANITIZER=address \
             python -m unittest -f tests.unit_pte_recovery_errors -v
-              
+
       - name: Verify PTE recovery errors with UndefinedBehaviorSanitizer
         run: |
           RVZR_PARSER_SANITIZER=undefined \
             python -m unittest -f tests.unit_pte_recovery_errors -v
-              
+
 
       - name: Characterize cache observation semantics
         run: |
