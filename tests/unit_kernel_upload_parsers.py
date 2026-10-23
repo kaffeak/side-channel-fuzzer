@@ -124,7 +124,8 @@ def _callback_unit() -> str:
              '#include "sandbox_manager.h"\n#include "code_loader.h"\n'
              '#include "shortcuts.h"\nstruct kobject;\nstruct kobj_attribute;\n'
              'extern bool tc_ready, inputs_ready, unfinished_call;\n'
-             'extern int next_measurement_id;\n']
+             'extern int next_measurement_id;\nextern long uarch_reset_rounds;\n'
+             'struct file;\nstruct bin_attribute;\n#define bin_attr_t struct bin_attribute\n']
     # Single-threaded boundary instrumentation, NOT an implementation of kernel mutexes.
     parts.append('struct mutex { bool held; size_t entries; };\n'
                  '#define DEFINE_MUTEX(name) struct mutex name = {false, 0}\n'
@@ -140,7 +141,9 @@ def _callback_unit() -> str:
     end = source.index("// RVZR_CALLBACK_WRAPPERS_END", start)
     parts.append(source[start:end] + "\n")
     for name in ("check_test_case_compat", "test_case_store_unlocked", "inputs_store_unlocked",
-                 "trace_show_unlocked"):
+                 "trace_show_unlocked", "inputs_show_unlocked", "print_data_base_show_unlocked",
+                 "print_code_base_show_unlocked", "test_case_bin_read_unlocked",
+                 "warmups_store_unlocked"):
         matches = list(re.finditer(
             rf"^static (?:int|ssize_t) {name}\([^;{{}}]*\)\n\{{\n.*?^\}}$",
             source, re.MULTILINE | re.DOTALL))
@@ -151,7 +154,7 @@ def _callback_unit() -> str:
         parts.append(f"#line {line} {json.dumps(str(path))}\n{match.group()}\n")
         if name.endswith("_unlocked"):
             callback = name.removesuffix("_unlocked")
-            wrappers = re.findall(rf"^RVZR_LOCKED_(?:SHOW|STORE)\({callback}\)$",
+            wrappers = re.findall(rf"^RVZR_LOCKED_(?:SHOW|STORE|BIN_READ)\({callback}\)$",
                                   source, re.MULTILINE)
             if len(wrappers) != 1:
                 raise RuntimeError(f"Cannot isolate production wrapper for {callback}")
@@ -171,6 +174,19 @@ def _callback_unit() -> str:
                  'ssize_t host_trace_show(char *buf)\n'
                  '{ size_t before = executor_mutex.entries;\n'
                  '  ssize_t ret = trace_show(NULL, NULL, buf);\n'
+                 '  check_callback_unlock(before); return ret; }\n')
+    for name in ("inputs_show", "print_data_base_show", "print_code_base_show"):
+        parts.append(f'ssize_t host_{name}(char *buf)\n'
+                     '{ size_t before = executor_mutex.entries;\n'
+                     f'  ssize_t ret = {name}(NULL, NULL, buf);\n'
+                     '  check_callback_unlock(before); return ret; }\n')
+    parts.append('ssize_t host_test_case_bin_read(char *buf)\n'
+                 '{ size_t before = executor_mutex.entries;\n'
+                 '  ssize_t ret = test_case_bin_read(NULL, NULL, NULL, buf, 0, PAGE_SIZE);\n'
+                 '  check_callback_unlock(before); return ret; }\n'
+                 'ssize_t host_warmups_store(void)\n'
+                 '{ size_t before = executor_mutex.entries;\n'
+                 '  ssize_t ret = warmups_store(NULL, NULL, "7", 1);\n'
                  '  check_callback_unlock(before); return ret; }\n')
     return "".join(parts)
 
@@ -420,7 +436,8 @@ bool host_input_idle(void) {
                                                          unfinished, "execute")
                     self.check_rejected_trace(records[0], trace_calls=0)
                     self.assertEqual(records[0]["next_before"], -1)
-                    self.assertEqual(stderr, "[rvzr_executor:trace_show] Assertion failed: "
+                    self.assertEqual(stderr, "" if unfinished else
+                                     "[rvzr_executor:trace_show] Assertion failed: "
                                      "tc_ready && inputs_ready\n")
 
     def test_trace_rejects_unready_pending_results(self) -> None:
@@ -431,7 +448,8 @@ bool host_input_idle(void) {
                                                          unfinished, "pending")
                     self.check_rejected_trace(records[0], trace_calls=0)
                     self.assertEqual(records[0]["next_before"], 1)
-                    self.assertEqual(stderr, "[rvzr_executor:trace_show] Assertion failed: "
+                    self.assertEqual(stderr, "" if unfinished else
+                                     "[rvzr_executor:trace_show] Assertion failed: "
                                      "tc_ready && inputs_ready\n")
 
     def test_trace_ready_executes_and_formats_results(self) -> None:
@@ -446,6 +464,88 @@ bool host_input_idle(void) {
         self.assertEqual(bytes.fromhex(record["output_hex"]), expected)
         self.assertEqual(record["ret"], len(expected))
 
+    def terminal_records(self, mode: str) -> List[Dict[str, Any]]:
+        environment = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                           UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+        result = subprocess.run(
+            [str(self.binary), "terminal", mode]
+            + [str(self.fixtures[kind][0]) for kind in ("rcbf", "rdbf", "rcbf_missing_end")],
+            capture_output=True, text=True, check=False, timeout=5, env=environment)
+        self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+        records: List[Dict[str, Any]] = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(records[-1], {"event": "teardown", "live_bytes": 0})
+        if mode in ("failure", "success"):
+            self.assertEqual(result.stderr, "")
+        if os.environ.get("RVZR_PARSER_VERBOSE") == "1":
+            print(json.dumps({"terminal_mode": mode, "records": records,
+                              "stderr": result.stderr}))
+        return records[:-1]
+
+    def test_failed_trace_blocks_uploads_retrace_readers_and_configuration(self) -> None:
+        records = self.terminal_records("failure")
+        admissions = [record for record in records if record["event"] == "admission"]
+        baseline = admissions[0]
+        self.assertEqual(baseline["operation"], "after_trace")
+        self.assertEqual(baseline["ret"], -errno.EIO)
+        self.assertTrue(baseline["unfinished"])
+        self.assertFalse(baseline["tc_ready"])
+        self.assertFalse(baseline["inputs_ready"])
+        self.assertEqual(baseline["next"], -1)
+        self.assertEqual(baseline["trace_calls"], 1)
+        self.assertEqual(baseline["sandbox_calls"], 1)
+        self.assertEqual(baseline["code_calls"], 1)
+        operations = ["test_upload", "input_upload", "retrace", "inputs_show", "data_base",
+                      "code_base", "binary", "warmups_store"] * 2
+        self.assertEqual([record["operation"] for record in admissions[1:]], operations)
+        for record in admissions[1:]:
+            with self.subTest(operation=record["operation"]):
+                self.assertEqual(record["ret"], -errno.EIO)
+                self.assertTrue(record["buffer_unchanged"])
+                # Includes both parser cursors, all counted calls/allocations and readiness.
+                self.assertEqual({key: value for key, value in record.items()
+                                  if key not in ("operation", "ret")},
+                                 {key: value for key, value in baseline.items()
+                                  if key not in ("operation", "ret")})
+        traces = [record for record in records if record["event"] == "trace"]
+        self.assertEqual(len(traces), 3)
+        self.assertEqual(traces[0]["ret"], -errno.EIO)
+        self.assertTrue(traces[0]["buffer_unchanged"])
+        self.assertEqual(traces[0]["output_hex"], "")
+        for record in traces[1:]:
+            self.check_rejected_trace(record, trace_calls=1)
+
+    def test_terminal_condition_dominates_even_ready_pending_results(self) -> None:
+        # Synthetic inconsistent metadata tests priority; not a claimed native failure state.
+        stderr, records = self.trace_records(True, True, True, "pending")
+        self.assertEqual(stderr, "")
+        self.check_rejected_trace(records[0], trace_calls=0)
+        self.assertEqual(records[0]["next_after"], 1)
+        self.assertTrue(records[0]["unfinished_after"])
+
+    def test_nonterminal_operations_allow_later_preparation_and_execution(self) -> None:
+        for mode in ("success", "parser-error", "unready"):
+            with self.subTest(mode=mode):
+                records = self.terminal_records(mode)
+                admissions = [record for record in records if record["event"] == "admission"]
+                for record in admissions:
+                    self.assertFalse(record["unfinished"])
+                    if record["operation"] not in ("after_trace", "ordinary_parser_error",
+                                                   "ordinary_unready"):
+                        self.assertGreater(record["ret"], 0)
+                    if record["operation"] in ("inputs_show", "data_base", "code_base", "binary"):
+                        self.assertFalse(record["buffer_unchanged"])
+                    if record["operation"] == "warmups_store":
+                        self.assertEqual(record["warmups"], 7)
+                if mode != "success":
+                    self.assertLess(admissions[0]["ret"], 0)
+                    self.assertEqual(admissions[0]["trace_calls"], 0)
+                traces = [record for record in records if record["event"] == "trace"]
+                self.assertEqual(traces[-1]["trace_calls"], 2)
+                self.assertGreater(traces[-1]["ret"], 0)
+                self.assertTrue(traces[-1]["tc_ready"])
+                self.assertTrue(traces[-1]["inputs_ready"])
+                self.assertFalse(traces[-1]["unfinished_after"])
+
     def test_trace_error_unlocks_without_claiming_recovery(self) -> None:
         stderr, records = self.trace_records(True, True, False, "error")
         self.assertEqual(stderr, "")
@@ -454,7 +554,9 @@ bool host_input_idle(void) {
         self.assertEqual(record["trace_calls"], 1)
         self.assertEqual(record["next_after"], -1)
         self.assertTrue(record["buffer_unchanged"])
-        # Existing legacy state, not evidence of native recovery: the adapter separately
+        self.assertFalse(record["tc_ready"])
+        self.assertFalse(record["inputs_ready"])
+        # Terminal admission, not evidence of native recovery: the adapter separately
         # requires one acquisition and a released boundary even on this negative return.
         self.assertTrue(record["unfinished_after"])
 

@@ -101,6 +101,8 @@ unsigned inputs_top = 0;
 bool inputs_ready = false;
 bool tc_ready = false;
 
+// While executor_mutex is held: transient during tracing, terminal after a trace error.
+// Later callbacks must not reuse or replace resources whose restoration is unproven.
 bool unfinished_call = false;
 
 // Process-context entry serialization only; not proof of successful fault recovery.
@@ -108,12 +110,14 @@ static DEFINE_MUTEX(executor_mutex);
 
 // RVZR_CALLBACK_WRAPPERS_BEGIN
 // Inner bodies may return through ASSERT/CHECK_ERR; the outer callback always unlocks.
+// With the mutex acquired, unfinished_call can only be left by an unsuccessful trace.
+// No callback clears this terminal condition or provides a recovery operation.
 #define RVZR_LOCKED_SHOW(name)                                                                     \
     static ssize_t name(struct kobject *kobj, struct kobj_attribute *attr, char *buf)                \
     {                                                                                            \
         ssize_t ret;                                                                             \
         mutex_lock(&executor_mutex);                                                             \
-        ret = name##_unlocked(kobj, attr, buf);                                                   \
+        ret = unfinished_call ? -EIO : name##_unlocked(kobj, attr, buf);                          \
         mutex_unlock(&executor_mutex);                                                           \
         return ret;                                                                              \
     }
@@ -124,7 +128,7 @@ static DEFINE_MUTEX(executor_mutex);
     {                                                                                            \
         ssize_t ret;                                                                             \
         mutex_lock(&executor_mutex);                                                             \
-        ret = name##_unlocked(kobj, attr, buf, count);                                            \
+        ret = unfinished_call ? -EIO : name##_unlocked(kobj, attr, buf, count);                   \
         mutex_unlock(&executor_mutex);                                                           \
         return ret;                                                                              \
     }
@@ -135,7 +139,7 @@ static DEFINE_MUTEX(executor_mutex);
     {                                                                                            \
         ssize_t ret;                                                                             \
         mutex_lock(&executor_mutex);                                                             \
-        ret = name##_unlocked(file, kobj, bin_attr, to, pos, count);                               \
+        ret = unfinished_call ? -EIO : name##_unlocked(file, kobj, bin_attr, to, pos, count);      \
         mutex_unlock(&executor_mutex);                                                           \
         return ret;                                                                              \
     }
@@ -298,8 +302,14 @@ static ssize_t trace_show_unlocked(struct kobject *kobj, struct kobj_attribute *
     unfinished_call = true;
     if (next_measurement_id < 0) {
         int err = trace_test_case();
-        if (err)
+        if (err) {
+            // Conservatively terminal for any admitted trace-pipeline error, including
+            // preflight failures: its return does not attest CPU/PTE restoration.
+            tc_ready = false;
+            inputs_ready = false;
+            next_measurement_id = -1;
             return -EIO;
+        }
 
         // start printing the results
         next_measurement_id = n_inputs - 1;

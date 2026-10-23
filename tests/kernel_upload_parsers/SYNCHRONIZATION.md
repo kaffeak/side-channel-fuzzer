@@ -1,17 +1,17 @@
-# B3.3d.5c: serialization of existing executor entry points
+# B3.3d.5c–5d: serialized callbacks and terminal admission
 
-This adds a real kernel mutex to the legacy executor interface. It does not
+B3.3d.5c adds a real kernel mutex to the legacy executor interface.
+B3.3d.5d adds fail-closed admission after a returned trace-pipeline error. It does not
 activate the [preparation protocol](KERNEL_INTEGRATION_PLAN.md), repair interrupted
 uploads, implement published-resource retirement or enable 16 KiB execution.
 The [ownership audit](NATIVE_OWNERSHIP.md) still governs native cleanup obligations.
 
 ## Boundary and participating callbacks
 
-[main.c:107](../../rvzr/executor_km/main.c#L107) defines one private
+[main.c:109](../../rvzr/executor_km/main.c#L109) defines one private
 `executor_mutex`. All 20 registered callbacks use outer wrappers defined at
-[:111](../../rvzr/executor_km/main.c#L111). Each takes the mutex before calling
-the existing body, now named `*_unlocked`, saves its exact return value, unlocks
-and returns. Attribute names, permissions and original callback signatures remain
+[:115](../../rvzr/executor_km/main.c#L115). Each takes the mutex, rejects terminal state with `-EIO`, or calls
+the existing body, now named `*_unlocked`, then unlocks and returns its result. Attribute names, permissions and original callback signatures remain
 unchanged, including `bin_attr_t` kernel-version handling.
 
 | Protected callbacks | Resources covered during that callback |
@@ -25,16 +25,16 @@ unchanged, including `bin_attr_t` kernel-version handling.
 | `enable_ssbp_patch_store`, `enable_prefetcher_store`, `enable_pre_run_flush_store`, `enable_hpa_gpa_collisions_store` | Execution-related configuration mutation. |
 | `measurement_mode_store`, `enable_quick_and_dirty_mode`, `enable_dbg_gpr_mode` | Template/measurement-related configuration mutation. |
 
-The inner bodies are unchanged except their names. In particular, an `ASSERT`
+The inner bodies retain their behavior except trace-error metadata invalidation. In particular, an `ASSERT`
 or `CHECK_ERR` returns from the inner function, not the lock-owning wrapper.
 Both positive short returns and negative errors therefore pass through unlock.
 No helper called from a locked body takes this mutex again. Original configuration
-rules remain: stores can change settings between callbacks; no new `-EBUSY`,
-readiness, attempt or generation rule is introduced.
+rules remain for nonterminal operation: stores can change settings between
+callbacks. No new `-EBUSY`, attempt or generation rule is introduced.
 
 The module resource initialization body is isolated in
-[executor_init_resources:738](../../rvzr/executor_km/main.c#L738), called under
-the mutex by `executor_init` at :782. Every initialization early return reaches
+[executor_init_resources:748](../../rvzr/executor_km/main.c#L748), called under
+the mutex by `executor_init` at :792. Every initialization early return reaches
 that caller's unlock. All managers finish before the first attribute is created.
 Interface creation occurs outside the mutex; a registration failure removes and
 drains already-created attributes outside it before dropping the kobject. The
@@ -68,10 +68,59 @@ removal may wait for an active callback that is waiting for the mutex. No new
 per-file lock, spinlock, workqueue or asynchronous experiment is introduced.
 No mutex operation is async-signal/fault recovery machinery.
 
+## Terminal admission (B3.3d.5d)
+
+All three wrapper macros check `unfinished_call` **after acquiring the same
+mutex and before calling any inner body**. All 20 callbacks participate, including
+uploads, trace execution/pagination, raw binary and base-address readers,
+diagnostics, and configuration. Terminal rejection returns exactly `-EIO`, writes
+no output and changes neither readiness, parser state, result cursor nor the
+terminal flag. It does not call parsers, allocation, loading or tracing helpers.
+There is no reset attribute or second recovery authority.
+
+The existing flag has only three production assignments: initialization to false,
+setting true after trace prechecks, and clearing after successful tracing (or
+normal pagination). The mutex excludes other callbacks during the transient true
+state. Thus a later callback acquiring the mutex with the flag still true follows
+an unsuccessful trace call; it cannot reach the statement that clears the flag.
+If execution never returns, this barrier cannot make progress or repair the CPU.
+
+At [trace_show_unlocked:291](../../rvzr/executor_km/main.c#L291), any nonzero return
+from `trace_test_case()` leaves the flag set, clears `tc_ready` and `inputs_ready`,
+sets `next_measurement_id=-1`, and returns `-EIO` before formatting results.
+Measurement storage remains allocated; it is neither freed nor published.
+A seeded inconsistent state with readiness true and a pending cursor is also
+rejected before any cursor change or output.
+
+This policy conservatively includes measurement-allocation/preflight failures:
+[measurement.c:324](../../rvzr/executor_km/measurement.c#L324) does not identify
+which errors occurred before generated execution. By contrast, ordinary parser,
+preparation and unready-trace rejections never set the flag and remain retryable.
+The four trace prechecks run before the flag is set. Output-formatting errors
+occur after it is cleared and are not treated as failed hardware experiments.
+
+An error return, mutex unlock or callback completion does **not** attest to
+CPU/vector/PTE restoration. `recover_orig_state()` at measurement.c:212 returns
+void; [sandbox_manager.c:294](../../rvzr/executor_km/sandbox_manager.c#L294)
+discards `restore_orig_host_permissions()`'s result. Measurement corruption at
+measurement.c:300 deliberately does not set `err`. Unreported failures/zero
+returns are not detected by this barrier. Native restoration and safety of
+returning/unlocking after a real failure remain unverified.
+
+The passive [state component](../../rvzr/executor_km/preparation_state.c) remains
+outside live Kbuild/callbacks. Its `RVZR_PREP_UNRECOVERABLE` rejection and failed
+cleanup transition are consistent with the chosen fail-closed policy, but are
+not integrated and do not independently authorize recovery or retirement.
+
+The raw binary reader's independent bounds/liveness defect remains: it replaces
+caller `count` using `pos + PAGE_SIZE`, does not reject negative offsets or prove
+backing capacity/readiness. Normal-state access is not made safe by this patch.
+The terminal gate merely prevents reaching that body after a reported trace error.
+
 ## Teardown: callback draining, with explicit remaining limits
 
-[remove_executor_interfaces:728](../../rvzr/executor_km/main.c#L728) removes all
-ordinary and binary attributes. [executor_exit:836](../../rvzr/executor_km/main.c#L836)
+[remove_executor_interfaces:738](../../rvzr/executor_km/main.c#L738) removes all
+ordinary and binary attributes. [executor_exit:846](../../rvzr/executor_km/main.c#L846)
 calls it **before** taking the mutex and invoking the existing destructors;
 final `kobject_put` follows unlock. Missing attributes
 are tolerated, so the same remover is used on either registration failure.
@@ -124,28 +173,29 @@ legacy streams mixing client bytes; stale base-address snapshots retained by
 Python; configuration changes after code preparation; global pagination shared
 between readers; failed-growth retries; raw binary-read bounds/liveness; and
 permission-snapshot validity. Callback serialization fixes none of those.
-After a negative trace result the wrapper unlocks without changing legacy
-readiness or clearing `unfinished_call`. Subsequent callbacks are serialized,
-but no failed-recovery admission gate is added or claimed.
+After a negative trace result, terminal admission now prevents further callback
+body entry. This protects against subsequent participating operations, but does
+not repair the failed execution or validate any restoration.
 
 ## Verification
 
 The existing host extractor now compiles the actual inner callbacks and actual
-production SHOW/STORE wrapper macros. A small single-threaded instrumentation
+production SHOW/STORE/BIN_READ wrapper macros. A small single-threaded instrumentation
 stub detects nested acquisition, double/missing unlock and the acquisition count.
 Real callback parser calls and counted preparation/trace stubs require the
 boundary to be held; adapters require it released after every callback return.
 This checks wrapper control flow, not Linux scheduling, contention or CPU recovery.
-Binary-reader wiring is audited by source checks; it is not a native binary-read
-test. No physical-page/vmap model or new protocol framework is added.
+Binary-reader wiring is source-audited and its actual callback is host-tested
+with owned backing, offset zero and a full-page destination; this is not native
+kernel validation or coverage of its separate count/offset defects. No physical-page/vmap model or new protocol framework is added.
 
-Three added regressions audit all 20 attribute callback bindings, verify
+The original B3.3d.5c regressions audit all 20 attribute callback bindings, verify
 interface-removal/destruction source order, and exercise a negative trace-stub
 return. The latter preserves `unfinished_call=true`, returns `-EIO` and emits no
 result bytes while the wrapper unlocks. It does not simulate a real failed
 experiment or prove restoration.
 
-Recorded on x86-64 WSL2 / GCC 13.3.0:
+Historical B3.3d.5c results on x86-64 WSL2 / GCC 13.3.0 (before 5d):
 
 | Check | Result |
 | --- | --- |
@@ -176,12 +226,61 @@ changes cannot validate these wrappers or teardown changes. Loaded-kernel
 contention, sysfs draining and lockdep behavior remain untested. No kernel module
 or generated test case was executed on hardware.
 
+## B3.3d.5d verification
+
+Before implementation, the 82-test parser/state baseline passed with one unchanged
+expected failure. New regressions failed against the old production wrappers:
+post-error requests reached inner bodies, and a seeded terminal/ready/pending
+state emitted 29 bytes rather than returning `-EIO`. The successful-operation,
+ordinary parser-error and unready-trace controls already passed.
+
+Three focused tests add these sequences using actual extracted production
+callbacks and wrapper macros:
+
+- Real valid preparation, one negative trace-stub return, then two repetitions of
+  test/input upload, retrace, readiness/base/code/binary reads and warmup mutation.
+  All requests return `-EIO`; parser/preparation/trace/allocation counts, parser
+  cursors and terminal metadata stay unchanged. Reader buffers stay untouched.
+- A seeded terminal state with otherwise-ready metadata and pending results,
+  proving that terminal admission takes priority over pagination.
+- Successful trace, ordinary semantic parser error, or unready trace, followed
+  by valid preparation/execution. Resource readers and configuration still work;
+  only the failed trace is terminal. The invalid fixture omits an end marker;
+  it does not depend on the separate uninitialized `has_start` issue.
+
+The trace-error regression additionally checks readiness withdrawal. Existing
+unready cases seeded with `unfinished_call=true` now expect the earlier terminal
+rejection rather than an inner assertion diagnostic. Ordinary diagnostics,
+successful output/pagination and interrupted-RDBF expected failure are unchanged.
+The stub models no CPU/PTE restoration and the harness directly frees only its
+owned parser fixtures at process end, not native potentially unsafe resources.
+
+| Check | B3.3d.5d result |
+| --- | --- |
+| Ordinary parser/callback/attempt + passive state | 85 run: 84 passed, one unchanged expected failure (64 parser-suite passes + expected failure; 20 state passes). |
+| Separate ASan and UBSan configurations | Same 85 outcomes each; no sanitizer findings. Existing WSL2 `detect_leaks=0` and independent allocation accounting retained. |
+| Supporting geometry/parity, input-format, descriptor, lifecycle/preparation/model/coverage, components and traces | 175 passed. |
+| Flake8 (100-column limit), strict mypy, Pylint | Passed; Pylint 10.00/10. |
+| GCC `-fanalyzer`, six host translation units | Compiled with the existing warning-only exceptions for parser signedness, callback unused parameters and validator `has_start` uninitialized use. No new harness/wrapper findings. |
+| `git diff --check` | Passed. |
+| Three native ARM64 module-build configurations | Not run locally; configured kernel headers and AArch64 compiler unavailable. CI unchanged. Earlier 5b results do not validate 5c or this uncommitted patch. |
+
+Safe unload is **not** established: the unchanged void module-exit callback cannot
+veto removal, even when it skips destruction because `unfinished_call` is true.
+No unload/reload recovery procedure is offered. Native destructors are unchanged.
+
 ## Smallest next prerequisite
 
-Under the established caller-held boundary, add explicit validity/capacity and
-allocation association for cached host PTE pointers, original snapshots and
-faulty-page state. Provide a narrowly checked retirement operation that refuses
-an unproven restoration state and does not free sandbox backing. Correct the
-sleepable-capacity reservation before using growing snapshots in the IRQ-off
-window. Only after those prerequisites and native verification can published
-utility/data retirement be connected; never use a caller-set `safe_to_free` flag.
+First reserve original-PTE and faulty-page snapshot capacity under the existing
+coordinator mutex in sleepable preparation context, before `pre_run()` disables
+IRQs/preemption. Remove growth allocations from
+[store_orig_host_permissions:255](../../rvzr/executor_km/page_tables_host.c#L255).
+Track actual capacity separately from the latest actor count, and track capture
+validity/count and association with the current mapping allocation. A failed or
+partial capture must not authorize restoration from uncaptured entries.
+
+Then propagate checked restoration failures and define a narrowly checked
+retirement operation that refuses unproven restoration and does not itself free
+sandbox backing. Only after those prerequisites and native verification can
+published utility/data retirement be connected; never use a caller-set
+`safe_to_free` flag. This patch implements none of those future changes.

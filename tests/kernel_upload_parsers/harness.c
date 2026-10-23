@@ -37,6 +37,12 @@ int next_measurement_id = -1;
 measurement_t *measurements;
 static measurement_t owned_measurements[64];
 static size_t trace_calls;
+long uarch_reset_rounds;
+static actor_data_t owned_actor_data;
+static actor_code_t owned_actor_code;
+static sandbox_t owned_sandbox;
+sandbox_t *sandbox;
+uint8_t *loaded_test_case_entry;
 
 uint64_t host_tc_cursor(void);
 uint64_t host_input_cursor(void);
@@ -45,6 +51,11 @@ bool host_input_idle(void);
 ssize_t host_test_case_store(const char *buf, size_t count);
 ssize_t host_inputs_store(const char *buf, size_t count);
 ssize_t host_trace_show(char *buf);
+ssize_t host_inputs_show(char *buf);
+ssize_t host_print_data_base_show(char *buf);
+ssize_t host_print_code_base_show(char *buf);
+ssize_t host_test_case_bin_read(char *buf);
+ssize_t host_warmups_store(void);
 bool host_callback_lock_held(void);
 ssize_t __real_parse_test_case_buffer(const char *buf, size_t count, bool *finished);
 ssize_t __real_parse_input_buffer(const char *buf, size_t count, bool *finished);
@@ -316,7 +327,7 @@ int trace_test_case(void)
     return trace_result;
 }
 
-static void observe_trace(size_t page)
+static ssize_t observe_trace(size_t page)
 {
     char buffer[PAGE_SIZE], before[PAGE_SIZE];
     memset(buffer, 0xA5, sizeof(buffer));
@@ -340,6 +351,7 @@ static void observe_trace(size_t page)
     for (ssize_t i = 0; i < ret; i++) printf("%02x", (unsigned char)buffer[i]);
     puts("\"}");
     fflush(stdout);
+    return ret;
 }
 
 static bool boolean_argument(const char *text)
@@ -396,6 +408,91 @@ static void upload_fixture(const char *path, bool input, bool incomplete)
         remaining -= (size_t)ret;
     }
     upload_id++;
+}
+
+static void admission_record(const char *operation, ssize_t ret, bool unchanged)
+{
+    printf("{\"event\":\"admission\",\"operation\":\"%s\",\"ret\":%zd,"
+           "\"buffer_unchanged\":%s,\"unfinished\":%s,\"tc_ready\":%s,\"inputs_ready\":%s,"
+           "\"next\":%d,\"parser_calls\":%zu,\"sandbox_calls\":%zu,\"code_calls\":%zu,"
+           "\"trace_calls\":%zu,\"allocation_attempts\":%zu,\"live_bytes\":%zu,"
+           "\"tc_cursor\":%llu,\"input_cursor\":%llu,\"warmups\":%ld}\n",
+           operation, ret, unchanged ? "true" : "false", unfinished_call ? "true" : "false",
+           tc_ready ? "true" : "false", inputs_ready ? "true" : "false", next_measurement_id,
+           parser_calls, sandbox_calls, code_calls, trace_calls, total_attempts, live_bytes,
+           host_tc_cursor(), host_input_cursor(), uarch_reset_rounds);
+}
+
+static void observe_resource_readers(void)
+{
+    /* Real readers, bounded owned backing. Never use poison pointers to infer a defect.
+     * The binary reader's separate count/offset defect is not exercised: full page, pos=0.
+     */
+    ssize_t (*readers[])(char *) = {host_inputs_show, host_print_data_base_show,
+                                  host_print_code_base_show, host_test_case_bin_read};
+    const char *names[] = {"inputs_show", "data_base", "code_base", "binary"};
+    for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++) {
+        char buffer[PAGE_SIZE], before[PAGE_SIZE];
+        memset(buffer, 0xA5, sizeof(buffer));
+        memcpy(before, buffer, sizeof(buffer));
+        ssize_t ret = readers[i](buffer);
+        if (ret > (ssize_t)sizeof(buffer)) fatal("reader exceeds owned output buffer");
+        admission_record(names[i], ret, !memcmp(buffer, before, sizeof(buffer)));
+    }
+    admission_record("warmups_store", host_warmups_store(), true);
+}
+
+static int terminal_admission_scenario(int argc, char **argv)
+{
+    if (argc != 6) fatal("usage: harness terminal failure|success|parser-error|unready RCBF RDBF BAD_RCBF");
+    bool failure = !strcmp(argv[2], "failure");
+    bool parser_error = !strcmp(argv[2], "parser-error");
+    bool unready = !strcmp(argv[2], "unready");
+    if (!(failure || parser_error || unready || !strcmp(argv[2], "success")))
+        fatal("unknown terminal admission scenario");
+    if (init_test_case_parser() || init_input_parser()) fatal("parser initialization failed");
+    measurements = owned_measurements;
+    owned_sandbox.data = &owned_actor_data;
+    owned_sandbox.code = &owned_actor_code;
+    sandbox = &owned_sandbox;
+    loaded_test_case_entry = (uint8_t *)&owned_actor_code;
+    if (parser_error) {
+        upload_fixture(argv[5], false, false);
+        admission_record("ordinary_parser_error", last_parser_ret, true);
+    }
+    if (unready) {
+        ssize_t ret = observe_trace(0);
+        admission_record("ordinary_unready", ret, true);
+    }
+    upload_fixture(argv[3], false, false);
+    upload_fixture(argv[4], true, false);
+    trace_result = failure ? -EIO : 0;
+    ssize_t trace_ret = observe_trace(1);
+    admission_record("after_trace", trace_ret, true);
+    if (failure) {
+        /* A terminal error must dominate even these bounded, otherwise valid requests.
+         * No stub models recovery; all observations concern callback admission only.
+         */
+        char data[MAX_FILE];
+        for (size_t repeat = 0; repeat < 2; repeat++) {
+            (void)read_fixture(argv[3], data);
+            admission_record("test_upload", host_test_case_store(data, 16), true);
+            (void)read_fixture(argv[4], data);
+            admission_record("input_upload", host_inputs_store(data, 16), true);
+            ssize_t ret = observe_trace(repeat + 2);
+            admission_record("retrace", ret, true);
+            observe_resource_readers();
+        }
+    } else {
+        observe_resource_readers();
+        upload_fixture(argv[3], false, false);
+        upload_fixture(argv[4], true, false);
+        observe_trace(2);
+    }
+    free_input_parser();
+    free_test_case_parser();
+    printf("{\"event\":\"teardown\",\"live_bytes\":%zu}\n", live_bytes);
+    return live_bytes ? 66 : 0;
 }
 
 static int preparation_scenario(int argc, char **argv)
@@ -633,6 +730,7 @@ static int reset_scenario(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "terminal")) return terminal_admission_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "attempt")) return attempt_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "trace")) return trace_scenario(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "prepare")) return preparation_scenario(argc, argv);
