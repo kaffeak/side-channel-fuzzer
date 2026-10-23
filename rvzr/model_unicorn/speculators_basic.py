@@ -243,8 +243,10 @@ class ARM64CondSpeculator(UnicornSpeculator):
     def decode(self, code: bytearray, flags: int) -> Tuple[int, bool]:
         """
         Decodes the instruction encoded in `code` and, if it's a conditional jump,
-        returns its expected target and whether it will jump to the target (based
-        on the `flags` value).
+        returns its target byte offset relative to the *following* instruction
+        and whether it will jump (using NZCV or the tested register). A zero
+        offset needs no speculation: both paths reach the following instruction.
+        Non-branches also return (0, False).
         """
         instruction = int.from_bytes(code, byteorder='little')
         first_byte = instruction >> 24
@@ -258,7 +260,9 @@ class ARM64CondSpeculator(UnicornSpeculator):
         return (0, False)
 
     def _decode_b_cond(self, instruction: int, flags: int) -> Tuple[int, bool]:
-        target = self._twos_complement(instruction >> 5, 19)
+        # A64 immediates are signed instruction offsets relative to the branch PC.
+        # The caller adds the instruction size, so compensate for those four bytes.
+        target = self._twos_complement(instruction >> 5, 19) * 4 - 4
         condition = instruction & 0xf
         n = (flags & FLAGS_N) != 0
         z = (flags & FLAGS_Z) != 0
@@ -283,7 +287,7 @@ class ARM64CondSpeculator(UnicornSpeculator):
             not z and n == v,  # c = b.gt "greater than"
             z or n != v,  # d = b.le "less than or equal"
             True,  # e = b.al "always"
-            False,  # f = b.nv "never"
+            True,  # f = b.nv (also always in A64)
         ][condition]
         return (target, will_jump)
 
@@ -310,7 +314,7 @@ class ARM64CondSpeculator(UnicornSpeculator):
             register_value &= 0xffff_ffff
         if first_byte & 0xf <= 0x5:
             # CBZ/CBNZ
-            target = self._twos_complement(instruction >> 5, 19)
+            target = self._twos_complement(instruction >> 5, 19) * 4 - 4
             if first_byte & 0xf == 4:
                 # CBZ
                 will_jump = register_value == 0
@@ -318,7 +322,7 @@ class ARM64CondSpeculator(UnicornSpeculator):
                 # CBNZ
                 will_jump = register_value != 0
         else:
-            target = self._twos_complement(instruction >> 5, 14)
+            target = self._twos_complement(instruction >> 5, 14) * 4 - 4
             bit_number = (instruction >> 19) & 0x1f
             if not is_32bit:
                 bit_number += 32

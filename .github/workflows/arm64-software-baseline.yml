@@ -152,6 +152,16 @@ jobs:
           python -m unittest tests.unit_arm64_contract_slice -v
 
 
+      - name: Verify ARM64 conditional-speculation contract
+        run: |
+          set -euo pipefail
+          python -c "import unicorn; print('Unicorn version:', unicorn.__version__)"
+          python -m unittest \
+            tests.unit_arm64_conditional_contract \
+            tests.unit_arm64_contract_slice \
+            -v
+
+
       - name: Characterize model coverage and resource lifetime
         run: |
           python -m unittest \
