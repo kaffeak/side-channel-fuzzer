@@ -291,7 +291,7 @@ int set_sandbox_page_tables(void)
     return 0;
 }
 
-void restore_orig_sandbox_page_tables(void) { restore_orig_host_permissions(); }
+int restore_orig_sandbox_page_tables(void) { return restore_orig_host_permissions(); }
 
 /// @brief Fast modification of the faulty page PTE; sets the permissions according to
 /// actor_t->data_permissions

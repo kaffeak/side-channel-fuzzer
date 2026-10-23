@@ -206,10 +206,11 @@ static int set_execution_environment(void)
     return 0;
 }
 
-/// @brief Restores the CPU state to the state before the test case execution. This function is
-/// written in a fail-safe manner, so that it can be called in fault handlers.
+/// @brief Attempts existing cleanup, including when called from fault handlers.
+/// Snapshot qualification and complete CPU restoration are not established here.
 /// @param void
-void recover_orig_state(void)
+/// @return Reported original host-PTE restore error; other cleanup helpers still return void.
+int recover_orig_state(void)
 {
     // restore VMX state
 #ifdef ARCH_X86_64
@@ -230,7 +231,7 @@ void recover_orig_state(void)
 
     restore_faulty_page_permissions();
     restore_special_registers();
-    restore_orig_sandbox_page_tables();
+    return restore_orig_sandbox_page_tables();
 }
 
 // =================================================================================================
@@ -312,7 +313,8 @@ int run_experiment(void)
 cleanup:
     if (err)
         measurements[0].htrace[0] = 0; // communicate the error up to executor.py
-    recover_orig_state();
+    // Never turn a reported restore failure into successful experiment completion.
+    err |= recover_orig_state();
     CHECK_ERR("run_experiment:cleanup");
     return err;
 }

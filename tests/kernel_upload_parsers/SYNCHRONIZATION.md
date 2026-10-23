@@ -100,10 +100,10 @@ The four trace prechecks run before the flag is set. Output-formatting errors
 occur after it is cleared and are not treated as failed hardware experiments.
 
 An error return, mutex unlock or callback completion does **not** attest to
-CPU/vector/PTE restoration. `recover_orig_state()` at measurement.c:212 returns
-void; [sandbox_manager.c:294](../../rvzr/executor_km/sandbox_manager.c#L294)
-discards `restore_orig_host_permissions()`'s result. Measurement corruption at
-measurement.c:300 deliberately does not set `err`. Unreported failures/zero
+CPU/vector/PTE restoration. B3.3d.5e.1 below propagates the original host-PTE
+restore result through recovery, but other cleanup helpers still return void
+and no capture qualification is established. Measurement corruption deliberately
+does not set `err`. Unreported failures/zero
 returns are not detected by this barrier. Native restoration and safety of
 returning/unlocking after a real failure remain unverified.
 
@@ -157,7 +157,7 @@ It is **not a general safe-unload guarantee**:
 | --- | --- |
 | Participating callback serialization | One callback body at a time, including checks, all normal/error returns and result pagination, using the real kernel mutex. Runtime verification is still pending. |
 | Experiment call-stack quiescence | After a normal successful synchronous trace callback returns, its experiment/recovery call stack has returned. A later lock owner cannot overlap another participating trace body. This is not a CPU-state attestation. |
-| Verified CPU/vector/PTE restoration | Not established. Returns from restoration wrappers do not prove all state restored; the original-PTE wrapper discards a return, and fault paths need independent validity checks. |
+| Verified CPU/vector/PTE restoration | Not established. Propagating the original host-PTE restore result (5e.1) does not qualify its snapshots or errors in other void cleanup helpers. Fault paths need independent validity checks. |
 | Borrowed PTE/alias retirement | Not implemented. Restoring values leaves cached pointers/snapshots present; ownership metadata alone cannot authorize free. |
 
 Excluded from independent acquisition are internal parser/reset, allocator,
@@ -399,7 +399,7 @@ distinguish reserved capacity, entries actually captured, mappings actually
 modified, and the mapping allocation to which they belong. Cleanup must not
 restore uncaptured entries or dereference stale cached aliases; merely skipping
 all cleanup on a mixed setup error is not a correct replacement. Check and
-propagate restoration results, including the currently discarded result in
+propagate restoration results, including the then-discarded result in
 [sandbox_manager.c:294](../../rvzr/executor_km/sandbox_manager.c#L294). Keep that
 prerequisite separate from published-resource retirement, with no new reset,
 lock, transport or caller-supplied safety authority.
@@ -429,3 +429,125 @@ CI, parsers, active geometry, snapshot arrays and native destructors are unchang
 No module, generated instruction stream, privileged register or hardware
 measurement was executed. Failures during published sandbox preparation and
 the inability of module exit to veto unsafe unloading both remain unresolved.
+
+## B3.3d.5e.1: reported-error propagation only; qualification stopped
+
+**This is an independently sound subset, not completed capture-qualified PTE
+recovery.** The existing interfaces have no allocation-associated capture record.
+Adding a `captured` Boolean or comparing saved and current virtual addresses
+would permit stale snapshots after address reuse. No such flag, mapping identity,
+capture/dirty/restored counter or recovery authority is introduced here.
+
+### Actual change and error path
+
+| Production change | Meaning |
+| --- | --- |
+| `restore_orig_sandbox_page_tables()` at [sandbox_manager.c:294](../../rvzr/executor_km/sandbox_manager.c#L294), matching declaration in `include/sandbox_manager.h` | Return `int` and forward the existing host restore result instead of discarding it. |
+| `recover_orig_state()` at [measurement.c:213](../../rvzr/executor_km/measurement.c#L213), matching declaration in `include/measurement.h` | Return that result after the existing VM, faulty-page and special-register cleanup, in the same order. Zero still does not attest to those other void operations or valid snapshots. |
+| `run_experiment()` cleanup at [measurement.c:313](../../rvzr/executor_km/measurement.c#L313) | Combine the recovery result into `err`. A previously zero experiment result can no longer hide a reported original-host-PTE restoration error. An existing experiment error stays nonzero even if restoration reports zero. |
+
+The returned failure now follows the existing production path:
+`restore_orig_host_permissions` -> sandbox wrapper -> `recover_orig_state` ->
+`run_experiment`'s `CHECK_ERR` -> outer experiment -> `trace_test_case`'s
+`CHECK_ERR` -> `trace_show` -> terminal admission. The existing `CHECK_ERR`
+normalizes errors to `-EIO`. The diagnostic `measurements[0].htrace` error marker
+is still written before cleanup, so a newly reported cleanup failure need not
+zero that stored word; nevertheless the callback returns an error before
+publishing any result, withdraws both readiness flags and invalidates the cursor.
+No changes to successful formatting, pagination or allocations are made.
+
+All callers were audited. The only C caller of `recover_orig_state()` is the
+measurement cleanup. x86 fault-handler calls at
+[fault_handlers.S:157](../../rvzr/executor_km/x86/fault_handlers.S#L157) and :203
+already branch to recovery that sets `rax=1` at :420, then preserves it across
+vector restoration. They do not consume the C return, but do not convert a
+returned cleanup error into successful execution. Changing a no-argument void C
+function to return int requires no new assembly arguments/stack layout; no
+assembly was changed. This observation applies only if cleanup returns.
+ARM outer exception recovery still skips C PTE cleanup and returns `x0=1`;
+normal ARM outer exit preserves the C return across vector restoration. No new
+CPU/PTE-restoration claim is made for either architecture.
+
+### Concrete dependency preventing a small qualification patch
+
+| Current producer/consumer | Required coordinated change, not implemented |
+| --- | --- |
+| `safe_free_util_data()` / `safe_free_code()`, alias publication and `cache_host_pteps()` | Current private owner records contain bases/extents but no allocation identity or PTE-cache invalidation hook. Snapshot/cache association must be derived from actual acquisition/release and complete cache population, including failed replacement and address reuse. The present aliases and `old_n_actors` cannot supply that identity. |
+| `store_orig_host_permissions()` and `set_user_pages()` | Original capture can fail/stop partway through; restore has no captured extent. Metadata must distinguish storage from successful capture and cover every modified entry before setup changes permissions. Failed cache walks must not publish a valid full cache. |
+| Host faulty-page setter/restorer, per-input loading and cleanup | Faulty values need current-input capture extent and restoration progress. Setup cleanup can still precede the first setter. Newly zeroed storage is not a valid original PTE value. |
+| x86 guest/EPT setters/restorers at [page_tables_guest.c:380](../../rvzr/executor_km/x86/page_tables_guest.c#L380) through :462 | Separate snapshot arrays and backing allocations have the same unqualified prefix/lifetime problem. Their void interfaces do not report partial restoration. A host-only flag in the shared wrapper would not qualify them. ARM counterparts are no-ops, not proof that shared recovery is solved. |
+| x86 generated permission macro at [macros.c:703](../../rvzr/executor_km/x86/macros.c#L703) | Embeds a cached host PTE address and modifies it directly. A dirty flag updated only by C permission helpers misses this consumer. Lifetime/capture accounting must cover the embedded reference too. |
+| Native restore and fault escape paths | `restore_pte()` and `native_page_invalidate()` return void. Completed write/invalidation and captured mapping identity must be accounted for without marking interrupted operations restored. ARM escapes without C cleanup; x86 can re-enter cleanup on a fault. Changing only the ordinary C return cannot resolve these cases. |
+
+A correct restoration entry needs all of: a live cached PTE belonging to the
+current actual allocation, a successfully captured original value for that
+entry/experiment, and sufficient ownership/lifetime exclusion through the
+restore operation. Modification/restoration progress must be separate from
+allocated capacity and captured extent. Restored state may be recorded only
+after that operation completes, not on allocation, function entry or attempted
+write. On uncertain identity/capture/restore, preserve terminal failure rather
+than dereferencing a stale pointer, clearing pending work or authorizing reuse.
+Skipping all restoration on a setup error is insufficient because a prefix may
+already have changed.
+
+Implementing those semantics spans allocation-lifetime hooks, host and guest
+snapshot producers, generated borrowers and fault recovery. Under the requested
+stopping condition this patch stops at reported-error propagation. In particular,
+it does **not** prevent the existing stale/uncaptured reads or writes, establish
+partial rollback, or record successfully restored entries. `page_tables_host.c`,
+all PTE storage/growth/allocation sites, mapping ownership and destructors remain
+unchanged. `NATIVE_OWNERSHIP.md`'s ownership semantics are unchanged too.
+
+### Focused verification and outstanding activation gates
+
+`unit_pte_recovery_errors.py` extracts the exact production sandbox restore
+wrapper, measurement recovery/loop/trace functions, trace callback and wrapper
+macros without replacing statements. CPU setup/IRQ handling, assembly entry,
+PTE helpers, data loading and a normal host C entry function are bounded stubs.
+There are no synthetic PTE values or simulated physical restoration. Six tests
+cover raw error forwarding, cleanup order, a new error after otherwise successful
+measurement, propagation to real callback terminal rejection, unchanged successful
+trace formatting, and an already-failed setup remaining negative. The setup
+case explicitly characterizes the remaining early faulty-restore risk; it is
+not a specification that such restoration is safe.
+
+Partial-capture/modification, actual restore failure and replaced-mapping
+invalidation tests are **not** implemented: they require the real missing
+qualification mechanism. Controlled `-EIO`/`-ESTALE` helper returns test error
+plumbing only, not whether the current host helper detects those conditions.
+
+Local x86-64 WSL2 / GCC 13.3.0 results:
+
+| Check | Result |
+| --- | --- |
+| Ordinary recovery-error + parser/callback/attempt + passive state suites | 91 run: 90 passed, one unchanged interrupted-RDBF expected failure. Includes six new recovery-error tests. |
+| Separate ASan and UBSan configurations | Same 91 outcomes each; no sanitizer finding. Existing documented WSL2 LeakSanitizer setting retained. |
+| Supporting Python regressions | 175 passed. |
+| Flake8 (100-column limit), strict mypy, Pylint on the new Python test | Passed; Pylint 10.00/10. |
+| GCC `-fanalyzer` build and execution of the six new tests | Passed. Only extracted measurement functions retain the existing pointer-sign warning as nonfatal; original callback unused-argument warnings remain nonfatal. Host stub warnings otherwise remain fatal. This is not analysis of the whole kernel module or page-table manager. |
+
+Reproduce with:
+
+```sh
+python -m unittest -f tests.unit_pte_recovery_errors tests.unit_kernel_upload_parsers tests.unit_preparation_state -v
+RVZR_PARSER_SANITIZER=address RVZR_PREPARATION_SANITIZER=address \
+  python -m unittest -f tests.unit_pte_recovery_errors tests.unit_kernel_upload_parsers tests.unit_preparation_state -v
+RVZR_PARSER_SANITIZER=undefined RVZR_PREPARATION_SANITIZER=undefined \
+  python -m unittest -f tests.unit_pte_recovery_errors tests.unit_kernel_upload_parsers tests.unit_preparation_state -v
+CC='cc -fanalyzer' python -m unittest -f tests.unit_pte_recovery_errors -v
+```
+
+The latest task reports **5d** passed the three native ARM64 builds; that updates
+the earlier historical pending status above. The four production files changed
+here still need Ubuntu VMBUILD, Ubuntu non-VMBUILD and Asahi 16 KiB compile-only
+CI. No configured kernel build tree or AArch64 compiler is installed locally.
+CI is unchanged. Passing host tests or compilation cannot establish kernel
+allocator/locking/restore safety or Apple Silicon runtime compatibility.
+
+The next task must establish the allocation-associated capture/recovery contract
+above, with actual-production partial-capture/modified-prefix tests and checked
+restoration before retry. Only then can snapshot reservation move before
+`pre_run()` and capture become allocation-free. IRQ-disabled allocation,
+unsafe failed-preparation retry, void-exit unload limitations and published
+resource retirement all remain unresolved. No new reset, lock, transport,
+16 KiB execution path or Python execution behavior is introduced.

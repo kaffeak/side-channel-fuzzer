@@ -33,7 +33,9 @@ extern measurement_t *measurements;
 int trace_test_case(void);
 int run_experiment(void);
 
-void recover_orig_state(void);
+// Reports original host-PTE restore errors. Other cleanup helpers still return void.
+// A zero result is not proof of complete CPU/PTE restoration.
+int recover_orig_state(void);
 
 int alloc_measurements(void);
 int init_measurements(void);

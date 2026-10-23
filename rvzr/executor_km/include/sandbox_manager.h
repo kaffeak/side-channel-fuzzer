@@ -75,7 +75,8 @@ extern sandbox_t *sandbox;
 int get_sandbox_size_pages(void);
 
 int set_sandbox_page_tables(void);
-void restore_orig_sandbox_page_tables(void);
+// Reports the host restore result; does not attest snapshot validity or full recovery.
+int restore_orig_sandbox_page_tables(void);
 
 void set_faulty_page_permissions(void);
 void restore_faulty_page_permissions(void);
