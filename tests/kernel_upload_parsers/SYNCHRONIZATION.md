@@ -269,7 +269,10 @@ Safe unload is **not** established: the unchanged void module-exit callback cann
 veto removal, even when it skips destruction because `unfinished_call` is true.
 No unload/reload recovery procedure is offered. Native destructors are unchanged.
 
-## Smallest next prerequisite
+## Next prerequisite proposed in B3.3d.5d
+
+The B3.3d.5e inspection below identifies a recovery dependency that must be
+resolved before activating this reservation/capture change.
 
 First reserve original-PTE and faulty-page snapshot capacity under the existing
 coordinator mutex in sleepable preparation context, before `pre_run()` disables
@@ -284,3 +287,145 @@ retirement operation that refuses unproven restoration and does not itself free
 sandbox backing. Only after those prerequisites and native verification can
 published utility/data retirement be connected; never use a caller-set
 `safe_to_free` flag. This patch implements none of those future changes.
+
+## B3.3d.5e inspection: stopped at the capture/recovery dependency
+
+**Reservation is not implemented or activated in this milestone.** The stopping
+condition applies: adding a rejecting, allocation-free capture path is not enough
+while its caller can restore snapshots that were never captured. Only this note
+changes; no allocation site, native call sequence or capacity bookkeeping changes.
+The sleep-in-atomic problem below therefore remains unresolved.
+
+### Existing allocation and execution sequence
+
+1. [init_page_table_manager:440](../../rvzr/executor_km/page_tables_host.c#L440)
+   allocates the original-PTE container, one actor's data/code value arrays, the
+   utility value array, cached-PTE pointer arrays and one faulty-PTE value. The
+   page-walk self-test also uses `vmalloc`/`vfree`, during module initialization.
+2. [allocate_sandbox:230](../../rvzr/executor_km/sandbox_manager.c#L230), called
+   from the locked TC-upload callback, allocates/maps sandbox storage when it
+   grows, then calls `cache_host_pteps()`. Its pointer-array growth at
+   [page_tables_host.c:213](../../rvzr/executor_km/page_tables_host.c#L213) is in
+   sleepable preparation context, not the measurement window. Both managers
+   track the latest actor count rather than actual capacity; failed replacement
+   can still leave inconsistent public aliases. Stage 5d does not quarantine
+   preparation failures that never entered tracing.
+3. The locked trace callback calls
+   [trace_test_case:324](../../rvzr/executor_km/measurement.c#L324), which calls
+   `alloc_measurements()` before `pre_run()`. `pre_run()` configures PMU state,
+   calls `kernel_fpu_begin()` on x86, explicitly disables preemption at :143
+   (`get_cpu`) and saves/disables local IRQs at :146. The proposed reservation
+   would precede both architectures' setup, including the x86 FPU helper.
+4. `run_experiment_outer()` calls `run_experiment()`, which calls
+   `set_sandbox_page_tables()` at measurement.c:250. That immediately calls
+   [store_orig_host_permissions:255](../../rvzr/executor_km/page_tables_host.c#L255).
+   Growth at :261-269 frees old data/code/faulty arrays and calls
+   `CHECKED_ZALLOC` three times. The macro expands to `kzalloc(..., GFP_KERNEL)`
+   ([shortcuts.h:122](../../rvzr/executor_km/include/shortcuts.h#L122)). These
+   potentially sleeping allocations occur with IRQs/preemption disabled.
+   Partial allocation failure can also discard prior ownership/data.
+5. Normal capture copies utility/data/code values, execution changes permissions,
+   and normal/error cleanup calls `recover_orig_state()`. Only after the outer
+   experiment returns does `post_run()` restore IRQs and call `put_cpu()`.
+
+The snapshot growth variable decreases when actor count decreases, so an increase
+within a formerly allocated extent can unnecessarily free/reallocate it. It is
+not a capacity field. There are no checked snapshot byte-size products here.
+
+One other explicit sleeping-allocation path remains in the inspected IRQ-off
+call graph: Intel guest execution calls `set_execution_environment()` ->
+`set_vmcs_state()`, whose growth branch uses `vfree`/`vmalloc` at
+[x86/vmx.c:377](../../rvzr/executor_km/x86/vmx.c#L377). Guest-page-table/faulty
+guest/EPT allocations in `map_sandbox_to_guest_memory()` instead run during
+`allocate_sandbox()`; they are not called by `set_sandbox_page_tables()`.
+ARM guest permission helpers are no-ops. No additional explicit allocator was
+found in the inspected ARM data-loading, special-register, vector-management
+or restore helpers. This is a source call-graph audit, not proof that the whole
+window or external kernel helpers are allocation/sleep safe. No `GFP_ATOMIC`
+workaround is proposed.
+
+### Why capacity-only rejection cannot establish a safe capture path
+
+- A failure from `set_sandbox_page_tables()` goes to `cleanup` at
+  [measurement.c:250](../../rvzr/executor_km/measurement.c#L250), then calls
+  `recover_orig_state()` at :315. That unconditionally calls faulty-page restore
+  (:231) and original-page restore (:233). A new insufficient-capacity return
+  from capture would inherit this error path if reached. Rejecting ordinary
+  shortages before `pre_run()` avoids those particular entries into the window,
+  but does not fix existing capture/setup failure recovery.
+- `faulty_ptes` is first populated for the current run at
+  [page_tables_host.c:394](../../rvzr/executor_km/page_tables_host.c#L394), through
+  `set_faulty_page_permissions()` at measurement.c:276. Setup errors at :250 or
+  :255 precede that capture. Nevertheless, restore at
+  [page_tables_host.c:409](../../rvzr/executor_km/page_tables_host.c#L409) writes
+  every `faulty_ptes[actor_id]` into a live PTE without a captured-entry check.
+  After initial/growing zero allocation these can be zero values; after reuse
+  they can describe an earlier capture. Original-PTE restore likewise has no
+  completed-capture/count check. Reserving or preserving array contents does
+  not make either snapshot current.
+- Cached PTE arrays can contain a partially refreshed prefix after a failed walk
+  and have no mapping-allocation association. The first-pointer assertions in
+  `store_orig_host_permissions()` do not validate all referenced entries. Its
+  copy loop can encounter an invalid later alias after copying a prefix.
+  ARM outer exception recovery at
+  [exception.S:249](../../rvzr/executor_km/arm64/exception.S#L249) does not call
+  `recover_orig_state()` before returning; x86 fault handlers do call it, without
+  capture validity. Neither path establishes valid partial-capture restoration.
+
+These are conditional consequences established from source, not reproduced
+kernel failures. Stage 5d rejects later callbacks only after the trace returns;
+it cannot protect the earlier cleanup accesses. The unchanged void exit callback
+still cannot veto unsafe unload. Neither limitation is resolved by this note.
+
+### Proposed boundary and smallest next task (not implemented)
+
+The intended reservation call belongs at the start of `trace_test_case()`, under
+the caller-held coordinator mutex and before `pre_run()` or PMU/FPU setup.
+Check positive bounded actor/input counts, actor-table/metadata sizes and input
+fragment/data sizes with checked multiplication before allocating. Do not walk
+sandbox/PTE aliases to infer capacity. These checks establish dimensions, not
+backing liveness or semantic preparation identity.
+
+Use actual allocated entry capacities for original data/code and faulty arrays,
+independent of requested counts. Growth must acquire all replacement arrays
+before publishing/freeing any old owner, preserve the old allocated prefix,
+and leave owners/capacities unchanged on failure. Reuse must not shrink capacity.
+Capture must check required extents before writing and contain no allocator.
+Allocation/validation failure must return before the IRQ-off window and reach
+the existing trace-error gate; reservation success must publish no validity flag.
+
+Before activating that change, define and test **capture-qualified recovery**:
+distinguish reserved capacity, entries actually captured, mappings actually
+modified, and the mapping allocation to which they belong. Cleanup must not
+restore uncaptured entries or dereference stale cached aliases; merely skipping
+all cleanup on a mixed setup error is not a correct replacement. Check and
+propagate restoration results, including the currently discarded result in
+[sandbox_manager.c:294](../../rvzr/executor_km/sandbox_manager.c#L294). Keep that
+prerequisite separate from published-resource retirement, with no new reset,
+lock, transport or caller-supplied safety authority.
+
+Capacity/growth/failure/overflow and preflight-order tests are deferred because
+there is no new production reservation implementation to exercise. A synthetic
+allocator/state machine would not establish this missing recovery contract.
+The existing host regressions are retained; they do not execute native PTE
+capture or restoration. Native build and runtime safety are not claimed.
+
+Local verification after the inspection (x86-64 WSL2, GCC 13.3.0):
+
+| Check | Result |
+| --- | --- |
+| Existing parser/callback/attempt + passive preparation-state suites, ordinary | 85 run: 84 passed and the unchanged interrupted-RDBF expected failure. |
+| Separate ASan / UBSan runs of the same suites | Each has the same 85 outcomes; no sanitizer finding. Existing WSL2 `detect_leaks=0` setting and independent allocation accounting retained. |
+| Supporting Python suites listed in the 5d results above | 175 passed. |
+| Flake8 (100-column limit), strict mypy and Pylint on the existing parser/state test wrappers | Passed; Pylint 10.00/10. These do not analyze native capture/recovery. |
+| `git diff --check` | Passed. Only this documentation file changed. |
+| New reservation/growth/failure/overflow tests | Not added or run: production reservation/capacity changes stopped at the dependency above. |
+| Kernel compilation / loaded-kernel checks | Not run. No production file changed; no configured native kernel build tree or AArch64 compiler is installed locally. Host tests compile only their existing extracted/shimmed sources. |
+
+The task reports native Ubuntu VMBUILD, Ubuntu non-VMBUILD and Fedora Asahi
+16 KiB compile-only success for **5c**. This inspection does not independently
+verify those runs, and **5d still requires its own native CI verification**.
+CI, parsers, active geometry, snapshot arrays and native destructors are unchanged.
+No module, generated instruction stream, privileged register or hardware
+measurement was executed. Failures during published sandbox preparation and
+the inability of module exit to veto unsafe unloading both remain unresolved.
