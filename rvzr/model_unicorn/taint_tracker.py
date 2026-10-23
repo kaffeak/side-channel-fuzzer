@@ -147,6 +147,16 @@ class UnicornTaintTracker:
         self._instruction.parse_static_operands(self._target_desc.reg_normalized)
         self._pending_taint = set()
 
+        # ARM B.cond metadata has a CondOp but omits flag reads and the PC write.
+        # Connect those operands to the shared PC-dependency propagation, without
+        # changing the instruction object or the executable branch semantics.
+        if CONF.instruction_set == "arm64" and instruction.name == "b.":
+            condition = instruction.get_cond_operand()
+            assert condition is not None, "ARM64 B.cond requires a condition operand"
+            flags = FlagsOp(tuple(self._target_desc.branch_conditions[condition.value]))
+            self._instruction.src_flags.update(flags.get_flags_by_type('read'))
+            self._instruction.dest_regs.add("RIP")
+
         # overwrite stale flag dependencies
         # FIXME: this feels like it should be in _finalize_instruction?
         flag_op = self._instruction.inst.get_flags_operand()
