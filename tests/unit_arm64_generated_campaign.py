@@ -8,6 +8,7 @@ written to a new RVZR_ARM64_CAMPAIGN_OUTPUT directory. No H-traces are produced.
 
 # pylint: disable=missing-class-docstring,missing-function-docstring,protected-access
 
+from collections import Counter
 from hashlib import sha256
 from importlib.metadata import version
 import json
@@ -21,6 +22,7 @@ import unittest
 
 from elftools.elf.elffile import ELFFile
 import numpy as np
+import unicorn as uc  # type: ignore[import-untyped]
 import unicorn.arm64_const as ucc  # type: ignore[import-untyped]
 
 from rvzr import factory
@@ -39,6 +41,7 @@ from tests.unit_arm64_conditional_contract import make_input, make_model
 _ARM = Path(__file__).resolve().parent / "arm64"
 _SEEDS = tuple(range(1, 9))  # Never use zero: the generator interprets it as a random seed.
 _REGISTERS = {"x1", "x2", "x3", "x5"}
+_FORMS = {"mov": 2, "add": 3}  # Explicit REG64 operand counts; no shifts/immediates/flags.
 _RANDOM_OFFSETS = tuple(range(12, 44, 4)) + tuple(range(56, 72, 4)) \
     + tuple(range(92, 108, 4))
 _FIXED = {
@@ -60,6 +63,76 @@ _FIXED = {
 class ARM64GeneratedCampaignTest(unittest.TestCase):
     current_seed: int = 0
 
+    def test_add_preserves_flags_branch_taints_and_checkpointed_result(self) -> None:
+        """CMP -> ADD (not ADDS) -> B.EQ: actual result/flags and taint dependencies.
+
+        Read hooks witness X3 before the join, including after real
+        conditional rollback. This is architectural-state evidence, not a CT value.
+        """
+        # Keep the real template/model/hook/input observations visible in one test.
+        # pylint: disable=too-many-locals
+        with tempfile.TemporaryDirectory(prefix="rvzr-arm64-add-") as temporary:
+            directory = Path(temporary)
+            with software_environment(directory):
+                CONF.model_max_spec_window = 32
+                source = (_ARM / "asm/conditional_contract_slice.asm").read_text(encoding="ascii")
+                needle = "cmp x0, #0\n    b.eq .taken"
+                self.assertEqual(source.count(needle), 1)
+                template = directory / "add-flags.asm"
+                source = source.replace(needle, "cmp x0, #0\n"
+                                        "    add x3, x1, x2\n    b.eq .taken")
+                # Retain X3 as a final architectural result. Wrong-path join ADD
+                # changes X5; rollback must restore X5 before the next path's load.
+                join = ".join:\n    add x3, x1, x2"
+                self.assertEqual(source.count(join), 1)
+                template.write_text(source.replace(join, ".join:\n    add x5, x1, x2"),
+                                    encoding="ascii")
+                isa = InstructionSet(str(_ARM / "min_arm64.json"))
+                case = factory.get_program_generator(1, isa).create_test_case_from_template(
+                    str(template))
+                observations: List[Tuple[int, int, int]] = []
+
+                def observe_read(emulator: uc.Uc, _access: int, _address: int, _size: int,
+                                 _value: int, _context: object) -> None:
+                    observations.append((int(emulator.reg_read(ucc.UC_ARM64_REG_X3)),
+                                         int(emulator.reg_read(ucc.UC_ARM64_REG_NZCV)),
+                                         int(emulator.reg_read(ucc.UC_ARM64_REG_X5))))
+
+                for clause in ("seq", "cond"):
+                    model = make_model(clause, case)
+                    hook = model.emulator.hook_add(uc.UC_HOOK_MEM_READ, observe_read)
+                    traces = []
+                    try:
+                        for selector, left, right in ((0, 7, 9), (1, (1 << 64)-1, 1), (1, 7, 9)):
+                            with self.subTest(clause=clause, selector=selector,
+                                              operands=(left, right)):
+                                observations.clear()
+                                input_ = make_input(selector)
+                                input_[0]["gpr"][1:3] = (left, right)
+                                result, taints = model.trace_test_case_with_taints(
+                                    [input_], nesting=1)
+                                expected = ((left+right) & ((1 << 64)-1),
+                                            0x60000000 if selector == 0 else 0x20000000, 0)
+                                self.assertEqual(observations, [expected] * (2 if clause == "cond"
+                                                                             else 1))
+                                self.assertEqual(model.emulator.reg_read(ucc.UC_ARM64_REG_X3),
+                                                 expected[0])
+                                self.assertEqual(model.emulator.reg_read(ucc.UC_ARM64_REG_X5),
+                                                 41 if selector == 0 else 18)
+                                # ADD's sources do not control this CT; X0 still does.
+                                mask = taints[0][0]["gpr"]
+                                self.assertTrue(mask[0])
+                                self.assertFalse(mask[1])
+                                self.assertFalse(mask[2])
+                                self.assertFalse(model.state.had_arch_fault)
+                                self.assertEqual(model._taint_tracker._checkpoints, [])
+                                self.assertEqual(model.speculator.nesting(), 0)
+                                traces.append(result[0].get_typed())
+                    finally:
+                        model.emulator.hook_del(hook)
+                    self.assertNotEqual(traces[0], traces[1])
+                    self.assertEqual(traces[1], traces[2])  # different sums, identical CT addresses
+
     def configure_pool(self) -> InstructionSet:
         CONF.contract_execution_clause = ["cond"]
         CONF.model_max_spec_window = 32
@@ -69,16 +142,18 @@ class ARM64GeneratedCampaignTest(unittest.TestCase):
         CONF.register_blocklist += ["x0", "x4", "w0", "w4"]
         isa = InstructionSet(str(_ARM / "min_arm64.json"))
         # Keep the complete parser vocabulary; restrict only the public random pool
-        # to the existing, unmodified MOV REG64,REG64 specification.
-        pool = [spec for spec in isa.non_memory_access_specs if spec.name == "mov"
-                and len(spec.operands) == 2
+        # to the existing MOV/ADD register forms, using the corrected fixture flags.
+        pool = [spec for spec in isa.non_memory_access_specs if spec.name in _FORMS
+                and len(spec.operands) == _FORMS[spec.name]
                 and all(op.type == OT.REG and op.width == 64 for op in spec.operands)]
-        self.assertEqual(len(pool), 1)
-        self.assertEqual(pool[0].implicit_operands, [])
-        for operand in pool[0].operands:
-            self.assertEqual(set(operand.values), _REGISTERS)
+        self.assertEqual(Counter(spec.name for spec in pool), Counter({"mov": 1, "add": 1}))
+        for spec in pool:
+            self.assertEqual(spec.implicit_operands, [])
+            for index, operand in enumerate(spec.operands):
+                self.assertEqual(set(operand.values), _REGISTERS)
+                self.assertEqual((operand.src, operand.dest), (index != 0, index == 0))
+            self.assertNotIn(spec.name, CONF.get_actors_conf()["main"]["instruction_blocklist"])
         isa.non_memory_access_specs = pool
-        self.assertNotIn("mov", CONF.get_actors_conf()["main"]["instruction_blocklist"])
         return isa
 
     def generate(self, seed: int, directory: Path,
@@ -114,20 +189,23 @@ class ARM64GeneratedCampaignTest(unittest.TestCase):
                 self.assertEqual((instruction.name, tuple(op.value for op in instruction.operands)),
                                  _FIXED[offset])
                 continue
-            self.assertEqual(instruction.name, "mov")
+            self.assertIn(instruction.name, _FORMS)
             self.assertFalse(instruction.is_from_template)
             self.assertFalse(instruction.is_instrumentation)
             self.assertFalse(instruction.is_control_flow)
             self.assertEqual(instruction.implicit_operands, [])
-            self.assertEqual(len(instruction.operands), 2)
+            self.assertIsNone(instruction.get_flags_operand())
+            self.assertEqual(len(instruction.operands), _FORMS[instruction.name])
             for index, operand in enumerate(instruction.operands):
                 self.assertIsInstance(operand, RegisterOp)
                 assert isinstance(operand, RegisterOp)
                 self.assertEqual(operand.width, 64)
                 self.assertIn(operand.value, _REGISTERS)
-                self.assertEqual((operand.src, operand.dest), (index == 1, index == 0))
+                self.assertEqual((operand.src, operand.dest), (index != 0, index == 0))
             generated.append({"offset": offset, "name": instruction.name,
-                              "operands": [op.value for op in instruction.operands], "width": 64})
+                              "operands": [op.value for op in instruction.operands], "width": 64,
+                              "operand_roles": [{"read": op.src, "write": op.dest}
+                                                for op in instruction.operands], "flags": None})
         self.assertEqual(len(generated), 16)
         return generated
 
@@ -143,6 +221,13 @@ class ARM64GeneratedCampaignTest(unittest.TestCase):
                          else [4224, 4224, 4096, 4096])
         self.assertEqual(model.emulator.reg_read(ucc.UC_ARM64_REG_X0), selector)
         self.assertEqual(model.emulator.reg_read(ucc.UC_ARM64_REG_X4), 0x10a080)
+        stored = 22 if selector == 0 else 11
+        loaded = int(input_[0]["main"][16 if selector == 0 else 0])
+        for register, value in ((ucc.UC_ARM64_REG_X1, stored), (ucc.UC_ARM64_REG_X2, loaded),
+                                (ucc.UC_ARM64_REG_X3, (stored+loaded) & ((1 << 64)-1)),
+                                (ucc.UC_ARM64_REG_NZCV,
+                                 0x60000000 if selector == 0 else 0x80000000)):
+            self.assertEqual(model.emulator.reg_read(register), value)
         expected = bytearray(input_.tobytes()[:4096])
         struct.pack_into("<Q", expected, 128 if selector == 0 else 0, 22 if selector == 0 else 11)
         self.assertEqual(bytes(model.emulator.mem_read(0x10a000, 4096)), expected)
@@ -232,6 +317,8 @@ class ARM64GeneratedCampaignTest(unittest.TestCase):
                         case, payload = self.generate(seed, directory / "primary", isa)
                         record["assembly_runs"] += 1
                         record["generated"] = self.validate_stream(case, payload)
+                        record["instruction_counts"] = dict(Counter(
+                            entry["name"] for entry in record["generated"]))
                         record["machine_code_sha256"] = sha256(payload).hexdigest()
                         duplicate, duplicate_payload = self.generate(seed, directory / "repeat",
                                                                      isa)
@@ -243,7 +330,12 @@ class ARM64GeneratedCampaignTest(unittest.TestCase):
                         self.exercise_case(case, directory, record)
                         record["status"] = "complete"
                     distinct = len({row["machine_code_sha256"] for row in records})
-                    self.assertGreater(distinct, 1)
+                    self.assertEqual(distinct, len(_SEEDS))
+                    frequencies: Counter[str] = Counter()
+                    for row in records:
+                        frequencies.update(row["instruction_counts"])
+                    self.assertEqual(set(frequencies), set(_FORMS))
+                    self.assertEqual(sum(frequencies.values()), len(_SEEDS)*16)
                 except (Exception, SystemExit) as error:
                     failure_report = {"seed": self.current_seed, "error": repr(error),
                                       "records": records}
@@ -255,9 +347,11 @@ class ARM64GeneratedCampaignTest(unittest.TestCase):
                                          f"{failure / 'campaign'}; {error!r}") from error
                 summary = {"seeds": len(records), "distinct_machine_code_streams": distinct,
                            "unicorn_version": version("unicorn"), "records": records,
+                           "instruction_counts": dict(frequencies),
                            "configuration": {"execution": "cond", "observation": "ct",
                                              "nesting": 1, "window": 32, "layout": "legacy-4k",
-                                             "random_form": "mov-reg64-reg64",
+                                             "random_forms": ["mov-reg64-reg64",
+                                                              "add-reg64-reg64-reg64"],
                                              "registers": sorted(_REGISTERS),
                                              "data_entropy_bits": 8,
                                              "special_value_probability": 0.0,
