@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Fixed architectural execution only. No input/program upload or HTrace output.
+// Fixed architectural execution only. Restricted raw InputData; no code or HTrace input/output.
 #define _GNU_SOURCE
 #if !defined(__linux__) || (!defined(__aarch64__) && !defined(RVZR_ARCH_HOST_TEST))
 #error "Native AArch64 Linux required; RVZR_ARCH_HOST_TEST is for the mock unit harness only."
@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -23,7 +24,12 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { MAIN_BYTES = 4096, FIXTURE_BYTES = 36, CASES = 3, DEADLINE_MS = 2000 };
+enum { MAIN_BYTES = 4096, FIXTURE_BYTES = 36, DEADLINE_MS = 2000,
+       FRAGMENT_BYTES = 12288, SELECTOR_OFFSET = 8192 };
+#define INPUT_FORMAT "rvzr-inputdata-raw-v1"
+typedef struct { unsigned char bytes[FRAGMENT_BYTES]; } input_t;
+_Static_assert(MAIN_BYTES <= SELECTOR_OFFSET && SELECTOR_OFFSET + 8 <= FRAGMENT_BYTES,
+               "serialized field bounds");
 enum { SETUP = 1, DATA_MAPPING, CODE_MAPPING, PUBLICATION, INVOCATION, CLEANUP, COMPLETE };
 static const char *const stages[] = {
     "parent", "setup", "data_mapping", "code_mapping", "publication",
@@ -51,6 +57,13 @@ typedef struct {
 extern const unsigned char rvzr_fixture[];
 extern const size_t rvzr_fixture_size;
 extern void rvzr_arch_invoke(void *code, void *main, uint64_t selector, arch_state_t *state);
+
+static uint64_t read_le64(const unsigned char *bytes)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i) value |= (uint64_t)bytes[i] << (8 * i);
+    return value;
+}
 
 // Three pages: inaccessible guard / one payload page / inaccessible guard.
 // No borrowed aliases, MAP_FIXED, shared code, or page-table manipulation.
@@ -93,14 +106,14 @@ static int region_open(region_t *region, size_t page, size_t bytes)
     return 0;
 }
 
-static int execute_fixed(result_t *result, size_t page, uint64_t selector, uint64_t word)
+static int execute_fixed(result_t *result, size_t page, const input_t *input)
 {
     region_t data = {0}, code = {0};
     int error = 0;
     result->stage = DATA_MAPPING;
     if (region_open(&data, page, MAIN_BYTES) != 0)
         goto failed;
-    memcpy(data.payload, &word, sizeof(word));
+    memcpy(data.payload, input->bytes, MAIN_BYTES);
     result->stage = CODE_MAPPING;
     if (rvzr_fixture_size != FIXTURE_BYTES) {
         errno = EINVAL;
@@ -118,11 +131,13 @@ static int execute_fixed(result_t *result, size_t page, uint64_t selector, uint6
     result->data_base = (uintptr_t)data.payload;
     result->code_base = (uintptr_t)code.payload;
     result->stage = INVOCATION;
-    rvzr_arch_invoke(code.payload, data.payload, selector, &result->state);
+    rvzr_arch_invoke(code.payload, data.payload, read_le64(input->bytes + SELECTOR_OFFSET),
+                     &result->state);
     memcpy(result->main, data.payload, MAIN_BYTES);
     // The sole allowed write is [main, main+8); also inspect 16K-page padding.
-    for (size_t i = sizeof(word); i < page; ++i) {
-        if (data.payload[i] != 0) {
+    for (size_t i = 8; i < page; ++i) {
+        unsigned char expected = i < MAIN_BYTES ? input->bytes[i] : 0;
+        if (data.payload[i] != expected) {
             errno = EPROTO;
             goto failed;
         }
@@ -149,6 +164,40 @@ static int64_t monotonic_ms(void)
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return -1;
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+// Snapshot one raw production fragment. Read at most one excess byte; require
+// EOF, handle short reads, and bound a stalled pipe. No mappings exist yet.
+static int read_input(int fd, input_t *input)
+{
+    unsigned char wire[FRAGMENT_BYTES + 1];
+    size_t used = 0;
+    int64_t start = monotonic_ms();
+    for (;;) {
+        int64_t now = monotonic_ms();
+        if (start < 0 || now < start) { errno = EIO; return -1; }
+        int64_t elapsed = now - start;
+        if (elapsed >= DEADLINE_MS) { errno = ETIMEDOUT; return -1; }
+        struct pollfd pending = {fd, POLLIN, 0};
+        int ready = poll(&pending, 1, DEADLINE_MS - (int)elapsed);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return -1;
+        if (ready == 0) { errno = ETIMEDOUT; return -1; }
+        if (pending.revents & POLLNVAL) { errno = EBADF; return -1; }
+        ssize_t count = read(fd, wire + used, sizeof(wire) - used);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count < 0) return -1;
+        if (count == 0) break;
+        used += (size_t)count; // read() returns at most the requested remaining capacity.
+        if (used == sizeof(wire)) { errno = E2BIG; return -1; }
+    }
+    if (used != FRAGMENT_BYTES) { errno = EINVAL; return -1; }
+    for (size_t i = MAIN_BYTES; i < FRAGMENT_BYTES; ++i) {
+        if (i >= SELECTOR_OFFSET && i < SELECTOR_OFFSET + 8) continue;
+        if (wire[i] != 0) { errno = ENOTSUP; return -1; }
+    }
+    memcpy(input->bytes, wire, FRAGMENT_BYTES); // Publish only a completely validated snapshot.
+    return 0;
 }
 
 // Only the owned child PID is killed/reaped. No recovery, retries or signal continuation.
@@ -212,11 +261,15 @@ static int failure(const char *stage, int error, int signal_number, int timed_ou
     return 1;
 }
 
-int main(int argc, char **argv)
+static int runner_main(int argc, char **argv)
 {
-    (void)argv;
-    if (argc != 1)
-        return failure("arguments: no program or input arguments accepted", EINVAL, 0, 0, 0);
+    if (argc != 3 || strcmp(argv[1], "--input-format") != 0)
+        return failure("arguments: --input-format rvzr-inputdata-raw-v1 required", EINVAL, 0, 0, 0);
+    if (strcmp(argv[2], INPUT_FORMAT) != 0)
+        return failure("unsupported_input_format", ENOTSUP, 0, 0, 0);
+    input_t input;
+    if (read_input(STDIN_FILENO, &input) != 0)
+        return failure("input", errno, 0, 0, 0);
     long page_value = sysconf(_SC_PAGESIZE);
     size_t span;
     if (page_value <= 0 || region_span((size_t)page_value, MAIN_BYTES, &span) != 0)
@@ -230,12 +283,15 @@ int main(int argc, char **argv)
     if (result == MAP_FAILED)
         return failure("result_mapping", errno, 0, 0, 0);
     printf("{\"kind\":\"metadata\",\"fixture\":\"b34a-fixed-body-v1\","
+           "\"input_format\":\"" INPUT_FORMAT "\","
            "\"architecture\":\"aarch64\",\"page_size\":%zu,\"kernel\":", page);
     json_string(system.release);
     puts("}");
     int outcome = 0;
-    for (unsigned index = 0; index < CASES; ++index) {
-        uint64_t selector = index, word = index == 2 ? 19 : 7;
+    // One snapshot per process; every break reaches shared-result cleanup below.
+    do {
+        uint64_t selector = read_le64(input.bytes + SELECTOR_OFFSET);
+        uint64_t word = read_le64(input.bytes);
         memset(result, 0, sizeof(*result));
         result->stage = SETUP;
         if (fflush(stdout) != 0) {
@@ -262,7 +318,7 @@ int main(int argc, char **argv)
                 result->error = errno;
                 _exit(1);
             }
-            _exit(execute_fixed(result, page, selector, word));
+            _exit(execute_fixed(result, page, &input));
         }
         int status = 0, timed_out = 0;
         int wait_error = wait_bounded(child, &status, &timed_out);
@@ -275,19 +331,26 @@ int main(int argc, char **argv)
                               WIFEXITED(status) ? WEXITSTATUS(status) : -1);
             break;
         }
-        printf("{\"kind\":\"architectural_state\",\"status\":\"ok\",\"input\":%u,"
+        printf("{\"kind\":\"architectural_state\",\"status\":\"ok\",\"input\":0,"
                "\"selector\":%" PRIu64 ",\"initial_word\":%" PRIu64 ","
                "\"data_base\":\"0x%" PRIxPTR "\",\"code_base\":\"0x%" PRIxPTR "\","
-               "\"x0_x7\":[", index, selector, word, result->data_base, result->code_base);
+               "\"x0_x7\":[", selector, word, result->data_base, result->code_base);
         for (unsigned j = 0; j < 8; ++j)
             printf("%s%" PRIu64, j == 0 ? "" : ",", result->state.regs[j]);
         printf("],\"nzcv\":%" PRIu64 ",\"sp_mod16\":%" PRIu64 ",\"main_hex\":\"",
                result->state.nzcv, result->state.sp_mod16);
         for (unsigned j = 0; j < MAIN_BYTES; ++j) printf("%02x", result->main[j]);
         puts("\"}");
-    }
+    } while (0);
     if (munmap(result, sizeof(*result)) != 0)
         return failure("result_cleanup", errno, 0, 0, 0);
-    if (outcome == 0) puts("{\"kind\":\"complete\",\"status\":\"ok\",\"cases\":3}");
+    if (outcome == 0) puts("{\"kind\":\"complete\",\"status\":\"ok\",\"cases\":1}");
     return fflush(stdout) == 0 && !ferror(stdout) ? outcome : 1;
 }
+
+#ifndef RVZR_ARCH_HOST_TEST
+int main(int argc, char **argv)
+{
+    return runner_main(argc, argv);
+}
+#endif

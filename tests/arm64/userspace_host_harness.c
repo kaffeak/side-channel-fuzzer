@@ -71,9 +71,7 @@ static int checked_munmap(void *address, size_t size)
 #define mmap checked_mmap
 #define mprotect checked_mprotect
 #define munmap checked_munmap
-#define main unused_native_main
 #include "../../tools/arm64_architectural_smoke.c"
-#undef main
 #undef mmap
 #undef mprotect
 #undef munmap
@@ -81,20 +79,46 @@ static int checked_munmap(void *address, size_t size)
 // Explicit nonexecuted stand-ins: no architectural measurements are manufactured.
 const unsigned char rvzr_fixture[FIXTURE_BYTES] = {0};
 const size_t rvzr_fixture_size = sizeof(rvzr_fixture);
+static const input_t *expected_input;
 void rvzr_arch_invoke(void *code, void *main, uint64_t selector, arch_state_t *state)
 {
-    (void)selector; (void)state;
+    (void)state;
     assert(saw_rx && live == 2);
     assert(main == (unsigned char *)allocations[0].base + allocations[0].span / 3);
     assert(code == (unsigned char *)allocations[1].base + allocations[1].span / 3);
     assert(allocations[0].prot == (PROT_READ | PROT_WRITE));
     assert(allocations[1].prot == (PROT_READ | PROT_EXEC));
+    assert(expected_input != NULL);
+    assert(memcmp(main, expected_input->bytes, MAIN_BYTES) == 0);
+    assert(selector == read_le64(expected_input->bytes + SELECTOR_OFFSET));
     ++invocations;
 }
 
 int main(int argc, char **argv)
 {
+    assert(argc >= 2);
+    if (strcmp(argv[1], "admission") == 0) {
+        int error = runner_main(argc - 1, argv + 1); // Actual admission, not an imitation.
+        assert(error != 0 && acquisitions == 0 && invocations == 0);
+        return error;
+    }
     assert(argc == 2);
+    if (strcmp(argv[1], "decode") == 0) {
+        input_t input;
+        memset(&input, 0xa5, sizeof(input));
+        if (read_input(STDIN_FILENO, &input) != 0) {
+            // Validation failures do not publish partially filled input state.
+            for (size_t i = 0; i < sizeof(input.bytes); ++i) assert(input.bytes[i] == 0xa5);
+            assert(acquisitions == 0 && invocations == 0);
+            return failure("input", errno, 0, 0, 0);
+        }
+        assert(acquisitions == 0 && invocations == 0);
+        printf("{\"kind\":\"decoded_input\",\"selector\":%" PRIu64 ",\"main_hex\":\"",
+               read_le64(input.bytes + SELECTOR_OFFSET));
+        for (size_t i = 0; i < MAIN_BYTES; ++i) printf("%02x", input.bytes[i]);
+        puts("\"}");
+        return 0;
+    }
     unsigned scenario = (unsigned)strtoul(argv[1], NULL, 10);
     size_t span = 0;
     assert(region_span(4096, 36, &span) == 0 && span == 12288);
@@ -133,12 +157,21 @@ int main(int argc, char **argv)
         if (scenario >= 3 && scenario <= 5) fail_protect = scenario - 2;
         if (scenario == 6) fail_release = 1;
         result_t result = {0};
-        size_t page = scenario == 8 ? 16384 : 4096;
-        int error = execute_fixed(&result, page, 0, 7);
-        assert(error == ((scenario == 0 || scenario == 8) ? 0 : 1));
-        assert(invocations == ((scenario == 0 || scenario == 6 || scenario == 8) ? 1U : 0U));
+        input_t input = {0};
+        input.bytes[0] = 7;
+        if (scenario == 12 || scenario == 13) {
+            for (size_t i = 0; i < MAIN_BYTES; ++i) input.bytes[i] = (unsigned char)(i * 17);
+            input.bytes[SELECTOR_OFFSET + 7] = 0x80;
+        }
+        expected_input = &input;
+        size_t page = scenario == 8 || scenario == 13 ? 16384 : 4096;
+        int error = execute_fixed(&result, page, &input);
+        int success = scenario == 0 || scenario == 8 || scenario == 12 || scenario == 13;
+        assert(error == (success ? 0 : 1));
+        assert(invocations == ((success || scenario == 6) ? 1U : 0U));
         assert(result.stage == COMPLETE || result.error != 0);
         assert(live == (scenario == 6 ? 1U : 0U));
+        if (success) assert(memcmp(result.main, input.bytes, MAIN_BYTES) == 0);
         if (scenario == 6) {
             assert(releases == 2 && result.stage == CLEANUP);
             // Verify retained mock ownership, then reclaim host test memory. For
