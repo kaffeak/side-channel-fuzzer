@@ -152,6 +152,15 @@ jobs:
           python -m unittest tests.unit_arm64_contract_slice -v
 
 
+      - name: Verify fixed ARM64 userspace architectural execution (no kernel module)
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          gcc --version
+          RVZR_REQUIRE_NATIVE=1 python -m unittest tests.unit_arm64_userspace_execution -v
+
+
       - name: Verify ARM64 conditional-speculation contract
         run: |
           set -euo pipefail
