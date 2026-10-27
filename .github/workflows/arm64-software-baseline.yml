@@ -343,3 +343,124 @@ jobs:
 
           echo "Fedora Asahi 16 KB kernel compilation PASSED"
 
+
+  arm64-kernel-fc45-16k:
+    name: Fedora Asahi 45 16 KB kernel build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+
+    container:
+      # Fedora's 45 manifest index selects this Linux/ARM64 image; config also verifies ARM64.
+      image: registry.fedoraproject.org/fedora@sha256:f7cc7fb58fd3dfa2d32591c4f45fc5acc9ebd95a7ee3de8de732c428c178a00f
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      CONTAINER_IMAGE: registry.fedoraproject.org/fedora@sha256:f7cc7fb58fd3dfa2d32591c4f45fc5acc9ebd95a7ee3de8de732c428c178a00f
+      KERNEL_RELEASE: 7.1.13-402.asahi.fc45.aarch64+16k
+      DEVEL_URL: https://download.copr.fedorainfracloud.org/results/@asahi/kernel/fedora-45-aarch64/Packages/k/kernel-16k-devel-7.1.13-402.asahi.fc45.aarch64.rpm
+      DEVEL_SHA256: 5f27bba98614799314d7fe2fc6286c8b1944d8abbf588b48318ef7b8a8d582fb
+      SIGNING_KEY_URL: https://download.copr.fedorainfracloud.org/results/@asahi/kernel/pubkey.gpg
+      # COPR @asahi/kernel fingerprint: 9E4DF9135D39DDFFC77B514EB2D8704E00C08EA0.
+      SIGNING_KEY_SHA256: 93372b0c24fdb10b6d6204ebedf8861b0dceffa7998b4d6c70f55bd69fe86668
+
+    steps:
+      - name: Install Fedora 45 container tools
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          source /etc/os-release
+          test "$ID" = fedora
+          test "$VERSION_ID" = 45
+          dnf -y install git curl util-linux binutils file kmod rpm
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile against Fedora Asahi 45 16 KB kernel
+        working-directory: rvzr/executor_km
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          devel_rpm="$RUNNER_TEMP/kernel-16k-devel-fc45.rpm"
+          signing_key="$RUNNER_TEMP/asahi-kernel.gpg"
+          curl --fail --location --retry 3 "$DEVEL_URL" -o "$devel_rpm"
+          curl --fail --location --retry 3 "$SIGNING_KEY_URL" -o "$signing_key"
+          printf '%s  %s\n' "$DEVEL_SHA256" "$devel_rpm" | sha256sum --check
+          printf '%s  %s\n' "$SIGNING_KEY_SHA256" "$signing_key" | sha256sum --check
+          rpmkeys --import "$signing_key"
+          rpmkeys --checksig --verbose "$devel_rpm" \
+            | tee "$RUNNER_TEMP/fc45-rpm-signature.log"
+          # Require a verified signature from the pinned key, not only valid digests.
+          grep -Ei 'signature.*00c08ea0.*: OK$' "$RUNNER_TEMP/fc45-rpm-signature.log"
+          test "$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "$devel_rpm")" \
+            = kernel-16k-devel-7.1.13-402.asahi.fc45.aarch64
+          dnf -y --setopt=localpkg_gpgcheck=1 install "$devel_rpm"
+
+          kernel_build="/usr/src/kernels/$KERNEL_RELEASE"
+          test -s "$kernel_build/Makefile"
+          test -s "$kernel_build/Module.symvers"
+          test "$(cat "$kernel_build/include/config/kernel.release")" = "$KERNEL_RELEASE"
+          grep -Fx "#define UTS_RELEASE \"$KERNEL_RELEASE\"" \
+            "$kernel_build/include/generated/utsrelease.h"
+          for option in ARM64 ARM64_16K_PAGES MODULES; do
+            grep -qx "CONFIG_$option=y" "$kernel_build/.config"
+            grep -qx "#define CONFIG_$option 1" "$kernel_build/include/generated/autoconf.h"
+          done
+          case "$(gcc -dumpmachine)" in
+            aarch64-*) ;;
+            *) echo "Expected a native AArch64 GCC toolchain" >&2; exit 1 ;;
+          esac
+
+          printf 'Repository commit: %s\n' "$(git rev-parse HEAD)"
+          printf 'Workflow commit: %s\nContainer: %s\n' "$GITHUB_SHA" "$CONTAINER_IMAGE"
+          printf 'Target kernel: %s\nHost kernel: %s\nHost page size: %s\n' \
+            "$KERNEL_RELEASE" "$(uname -r)" "$(getconf PAGESIZE)"
+          cat /etc/os-release
+          gcc --version
+          ld --version
+          rpm --version
+          rpm -q kernel-16k-devel
+          rpm -q gcc binutils make elfutils-libelf-devel openssl-devel
+          sha256sum "$devel_rpm" "$signing_key"
+
+          # Separate clean builds; neither variant is installed or executed.
+          for variant in vmbuild non-vmbuild; do
+            vm_flag=1
+            if [ "$variant" = non-vmbuild ]; then vm_flag=; fi
+            make -C "$kernel_build" M="$PWD" ARCH=arm64 VMBUILD="$vm_flag" clean
+            make -C "$kernel_build" M="$PWD" ARCH=arm64 CC=gcc VMBUILD="$vm_flag" \
+              V=1 -j"$(nproc)" modules 2>&1 | tee "$RUNNER_TEMP/fc45-$variant-build.log"
+            test -s rvzr_executor.ko
+            cp rvzr_executor.ko "$RUNNER_TEMP/rvzr_executor-fc45-$variant.ko"
+          done
+
+      - name: Verify Fedora Asahi 45 module metadata
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          for variant in vmbuild non-vmbuild; do
+            module="$RUNNER_TEMP/rvzr_executor-fc45-$variant.ko"
+            printf 'Variant: %s\n' "$variant"
+            file "$module"
+            readelf -h "$module" | tee "$RUNNER_TEMP/fc45-$variant-elf.log"
+            grep -Eq 'Class:[[:space:]]+ELF64' "$RUNNER_TEMP/fc45-$variant-elf.log"
+            grep -Eq 'Type:[[:space:]]+REL \(Relocatable file\)' \
+              "$RUNNER_TEMP/fc45-$variant-elf.log"
+            grep -Eq 'Machine:[[:space:]]+AArch64' "$RUNNER_TEMP/fc45-$variant-elf.log"
+            modinfo "$module"
+            vermagic="$(modinfo -F vermagic "$module")"
+            test "${vermagic%% *}" = "$KERNEL_RELEASE"
+            sha256sum "$module"
+            # Full diagnostics are already in the build log; repeat relevant lines for review.
+            awk 'tolower($0) ~ /warning:|error:|undefined!|undefined reference|unresolved/' \
+              "$RUNNER_TEMP/fc45-$variant-build.log"
+          done
+          echo "Compile-only checks passed; no Apple M3 Pro runtime or executor safety validation."
+
