@@ -32,6 +32,7 @@ from rvzr.model_unicorn.model import ARM64UnicornModel
 from rvzr.tc_components.test_case_data import InputData, save_input_sequence_as_rdbf
 from tests.unit_arm64_contract_slice import software_environment
 from tools.arm64_userspace_input import INPUT_FORMAT, encode_input
+from tools.arm64_userspace_program import APPROVED_PROGRAM, PROGRAM_FORMAT, export_approved_program
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,7 @@ _NATIVE = platform.system() == "Linux" and platform.machine().lower() == "aarch6
 _FLAGS = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
 _U64 = (1 << 64) - 1
 _INPUT_ARGS = ["--input-format", INPUT_FORMAT]
+_PROGRAM_ARGS = [*_INPUT_ARGS, "--program-format", PROGRAM_FORMAT]
 _BAD_ARGUMENTS: tuple[list[str], ...] = (
     [], ["untrusted.bin"], ["--input-format", "rdbf"],
     ["--input-format", "rvzr-inputdata-raw-v2"])
@@ -97,8 +99,22 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
         # pylint: disable-next=consider-using-with
         temporary = tempfile.TemporaryDirectory(prefix="rvzr-arch-host-tests-")
         cls.addClassCleanup(temporary.cleanup)
-        cls.host_binary = Path(temporary.name) / "host-ownership"
-        subprocess.run(["gcc", *_FLAGS, str(_ARM / "userspace_host_harness.c"),
+        directory = Path(temporary.name)
+        cls.host_binary = directory / "host-ownership"
+        with software_environment(directory):
+            obj = directory / "reference.o"
+            subprocess.run(["as", str(_TOOLS / "arm64_architectural_fixture.S"), "-o", str(obj)],
+                           check=True, timeout=10)
+            with obj.open("rb") as file:
+                section = ELFFile(file).get_section_by_name(".rodata.rvzr_fixture")
+                if section is None or section.data() != APPROVED_PROGRAM:
+                    raise RuntimeError("Assembled native reference differs from reviewed program")
+                code = section.data()
+        (directory / "rvzr_fixture_reference.h").write_text(
+            "const unsigned char rvzr_fixture[] = {" + ",".join(str(byte) for byte in code)
+            + "};\nconst size_t rvzr_fixture_size = sizeof(rvzr_fixture);\n")
+        subprocess.run(["gcc", *_FLAGS, "-I", str(directory),
+                        str(_ARM / "userspace_host_harness.c"),
                         "-o", str(cls.host_binary)], check=True, timeout=30)
 
     def setUp(self) -> None:
@@ -158,6 +174,132 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
 
     def test_complete_main_initialization_16k(self) -> None:
         self.host_scenario(13)
+
+    def test_received_program_copy_source_4k(self) -> None:
+        self.host_scenario(14)
+
+    def test_received_program_copy_source_16k(self) -> None:
+        self.host_scenario(15)
+
+    def test_export_actual_generated_program_and_decode_transport(self) -> None:
+        with software_environment(self.directory):
+            model = self.make_sequential_model()
+            program = export_approved_program(model.state.current_test_case())
+            self.assertEqual(program, self.assemble_fixture()[0])
+        for input_ in restricted_inputs():
+            wire = program + encode_input(input_)
+            result = subprocess.run([str(self.host_binary), "decode-program"], input=wire,
+                                    capture_output=True, check=False, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = json.loads(result.stdout)
+            self.assertEqual(row["kind"], "decoded_program")  # Parser output, never execution.
+            self.assertEqual(bytes.fromhex(row["program_hex"]), program)
+            self.assertEqual(row["selector"], int(input_[0]["gpr"][0]))
+            self.assertEqual(bytes.fromhex(row["main_hex"]), input_[0]["main"].tobytes())
+
+    def program_rejections(self, program: bytes, input_: bytes) -> dict[str, bytes]:
+        """GNU assembles disallowed instructions as data for rejection ONLY; never run."""
+        disallowed = [
+            ("branch-self", 4, "b.eq ."), ("branch-outside", 12, "b . +256"),
+            ("indirect-branch", 12, "br x0"), ("write-sp", 0, "mov sp, x0"),
+            ("write-lr", 0, "mov x30, x0"), ("write-platform", 0, "mov x18, x0"),
+            ("write-result-pointer", 0, "mov x19, x0"), ("write-main-base", 0, "mov x20, x0"),
+            ("external-store", 28, "str x3, [x0]"),
+            ("store-writeback", 28, "str x3, [x20], #8"),
+            ("load-outside-main", 20, "ldr x2, [x20, #4096]"),
+            ("privileged-register", 0, "mrs x0, sctlr_el1"),
+            ("uncontrolled-return", 32, "ret x0"), ("changed-instruction", 0, "nop"),
+        ]
+        source, obj = self.directory / "disallowed.s", self.directory / "disallowed.o"
+        source.write_text(".text\n" + "\n".join(row[2] for row in disallowed) + "\n")
+        subprocess.run(["as", str(source), "-o", str(obj)], check=True, timeout=10)
+        with obj.open("rb") as file:
+            section = ELFFile(file).get_section_by_name(".text")
+            assert section is not None
+            words = section.data()
+        self.assertEqual(len(words), 4 * len(disallowed))
+        invalid = {}
+        for index, (name, offset, _) in enumerate(disallowed):
+            altered = program[:offset] + words[index * 4:index * 4 + 4] + program[offset + 4:]
+            self.assertNotEqual(altered, program)
+            invalid[name] = altered + input_
+        for offset in range(36):
+            changed_bytes = bytearray(program)
+            changed_bytes[offset] ^= 1
+            invalid[f"changed-byte-{offset}"] = bytes(changed_bytes) + input_
+        invalid.update({f"code-length-{size}": program[:size] + input_
+                        for size in (0, 1, 4, 32, 34, 35)})
+        invalid.update(excess_code=program + b"\0\0\0\0" + input_,
+                       misaligned_prefix=b"\0" + program + input_,
+                       raw_input_only=input_, truncated_input=program + input_[:-1],
+                       excess_input=program + input_ + b"\0")
+        invalid["unsupported-input"] = program + malformed_payloads(input_)["sp"]
+        return invalid
+
+    def test_program_rejections_never_allocate_invoke_or_publish_partial_state(self) -> None:
+        with software_environment(self.directory):
+            model = self.make_sequential_model()
+            program = export_approved_program(model.state.current_test_case())
+            invalid = self.program_rejections(program, encode_input(restricted_inputs()[0]))
+            case = model.state.current_test_case()
+            raw_input = encode_input(restricted_inputs()[0])
+            invalid["elf-container"] = Path(case.get_obj().obj_path).read_bytes() + raw_input
+            rcbf = self.directory / "unsupported.rcbf"
+            case.get_obj().save_rcbf(str(rcbf))
+            invalid["rcbf-container"] = rcbf.read_bytes() + raw_input
+        for name, wire in invalid.items():
+            for mode in ("admission", "decode-program"):
+                with self.subTest(program=name, mode=mode):
+                    arguments = [str(self.host_binary), mode]
+                    if mode == "admission":
+                        arguments += _PROGRAM_ARGS
+                    result = subprocess.run(arguments, input=wire, capture_output=True,
+                                            check=False, timeout=5)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["kind"], "error")
+        for arguments in ([*_INPUT_ARGS, "--program-format", "unknown"],
+                          [*_INPUT_ARGS, "--program-path", "untrusted.bin"],
+                          [*_PROGRAM_ARGS, "--entry-offset", "1"]):
+            result = subprocess.run([str(self.host_binary), "admission", *arguments],
+                                    input=b"", capture_output=True, check=False, timeout=5)
+            self.assertEqual(result.returncode, 1, result.stderr)
+        print(f"Program admission: {len(invalid)} invalid packets rejected twice with "
+              "zero allocations/invocations; 3 unsupported argument requests rejected")
+
+    def test_program_export_rejects_bad_elf_template_and_metadata(self) -> None:
+        # These artifacts are inspected only. No mutated object is loaded into Unicorn or hardware.
+        with software_environment(self.directory):
+            model = self.make_sequential_model()
+            case = model.state.current_test_case()
+            obj = Path(case.get_obj().obj_path)
+            original = obj.read_bytes()
+            with obj.open("rb") as file:
+                section = ELFFile(file).get_section_by_name(".data.main")
+                assert section is not None
+                start = section["sh_offset"]
+            invalid = [b"", original[:63], original + bytes(65537)]
+            for offset, value in ((0, 0), (4, 1), (5, 2), (16, 2), (18, 62), (60, 17),
+                                  (start, 0), (start + 12, 0), (start + 44, 0), (start + 56, 0)):
+                changed = bytearray(original)
+                changed[offset] = value
+                self.assertNotEqual(changed, original)
+                invalid.append(bytes(changed))
+            for raw in invalid:
+                obj.write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    export_approved_program(case)
+            obj.write_bytes(original)
+            with patch.object(case, "n_actors", return_value=2), self.assertRaises(ValueError):
+                export_approved_program(case)
+            source = self.directory / "unresolved.s"
+            source.write_text(Path(case.asm_path()).read_text()
+                              + "\n.reloc .function_0, R_AARCH64_ABS64, unresolved_symbol\n")
+            subprocess.run(["as", str(source), "-o", str(obj)], check=True, timeout=10)
+            with self.assertRaisesRegex(ValueError, "Relocations"):
+                export_approved_program(case)
+
+    def test_execution_entry_rechecks_program_before_allocation(self) -> None:
+        self.host_scenario(16)
 
     def test_adapter_matches_production_raw_and_rdbf_payload_bytes(self) -> None:
         for index, input_ in enumerate(restricted_inputs()):
@@ -383,9 +525,14 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
             self.assertEqual(expected_state(inputs[0])[2], expected_state(inputs[4])[2])
             self.assertNotEqual(expected_state(inputs[0])[0], expected_state(inputs[4])[0])
 
-    def native_result(self, binary: Path, input_: InputData,
-                      model: ARM64UnicornModel) -> tuple[list[int], int, bytes]:
-        run = subprocess.run([str(binary), *_INPUT_ARGS], input=encode_input(input_),
+    def native_result(self, binary: Path, input_: InputData, model: ARM64UnicornModel,
+                      program: bytes | None = None) -> tuple[list[int], int, bytes]:
+        # This helper is used only by native tests with approved programs.
+        if program is not None:
+            self.assertEqual(program, APPROVED_PROGRAM)
+        wire = encode_input(input_) if program is None else program + encode_input(input_)
+        arguments = _INPUT_ARGS if program is None else _PROGRAM_ARGS
+        run = subprocess.run([str(binary), *arguments], input=wire,
                              capture_output=True, check=False, timeout=10)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         records = [json.loads(line) for line in run.stdout.splitlines()]
@@ -395,6 +542,8 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
         self.assertEqual(records[0]["input_format"], INPUT_FORMAT)
         self.assertEqual(records[0]["fixture"], "b34a-fixed-body-v1")
         self.assertEqual(records[0]["architecture"], "aarch64")
+        self.assertEqual(records[0]["program_source"],
+                         "embedded-reference" if program is None else "approved-generated")
         self.assertEqual(records[-1], {"kind": "complete", "status": "ok", "cases": 1})
         row = records[1]
         self.assertEqual(row["input"], 0)  # One fragment per process, not a campaign ordinal.
@@ -455,6 +604,27 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
             "native_fixture_executions": completed, "architectural_oracle_comparisons": completed,
             "sequential_model_comparisons": completed,
             "rejected_malformed_or_unsupported_inputs": len(invalid) + len(_BAD_ARGUMENTS),
+        }, sort_keys=True))
+
+    @unittest.skipUnless(_NATIVE, "Actual AArch64 Linux CPU required; no emulated native success")
+    def test_native_approved_generated_program_against_oracle_and_model(self) -> None:
+        binary = self.directory / "architectural-smoke"
+        subprocess.run(["gcc", *_FLAGS, str(_TOOLS / "arm64_architectural_smoke.c"),
+                        str(_TOOLS / "arm64_architectural_fixture.S"), "-o", str(binary)],
+                       check=True, timeout=30)
+        with software_environment(self.directory):
+            model = self.make_sequential_model()
+            program = export_approved_program(model.state.current_test_case())
+            inputs = restricted_inputs()
+            first = [self.native_result(binary, input_, model, program) for input_ in inputs]
+            repeated = [self.native_result(binary, input_, model, program) for input_ in inputs]
+            self.assertEqual(first, repeated)
+            completed = len(first) + len(repeated)
+            self.assertEqual(completed, 16)
+        print("Native approved generated-program verification:", json.dumps({
+            "native_fixture_executions": completed, "architectural_oracle_comparisons": completed,
+            "sequential_model_comparisons": completed, "program_format": PROGRAM_FORMAT,
+            "program_hex": program.hex(), "native_invalid_program_executions": 0,
         }, sort_keys=True))
 
 

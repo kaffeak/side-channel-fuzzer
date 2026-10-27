@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Fixed architectural execution only. Restricted raw InputData; no code or HTrace input/output.
+// One approved architectural program only. No general code loader or HTrace output.
 #define _GNU_SOURCE
 #if !defined(__linux__) || (!defined(__aarch64__) && !defined(RVZR_ARCH_HOST_TEST))
 #error "Native AArch64 Linux required; RVZR_ARCH_HOST_TEST is for the mock unit harness only."
@@ -27,6 +27,7 @@
 enum { MAIN_BYTES = 4096, FIXTURE_BYTES = 36, DEADLINE_MS = 2000,
        FRAGMENT_BYTES = 12288, SELECTOR_OFFSET = 8192 };
 #define INPUT_FORMAT "rvzr-inputdata-raw-v1"
+#define PROGRAM_FORMAT "rvzr-b34a-body-v1"
 typedef struct { unsigned char bytes[FRAGMENT_BYTES]; } input_t;
 _Static_assert(MAIN_BYTES <= SELECTOR_OFFSET && SELECTOR_OFFSET + 8 <= FRAGMENT_BYTES,
                "serialized field bounds");
@@ -63,6 +64,18 @@ static uint64_t read_le64(const unsigned char *bytes)
     uint64_t value = 0;
     for (unsigned i = 0; i < 8; ++i) value |= (uint64_t)bytes[i] << (8 * i);
     return value;
+}
+
+// An exact concrete-program gate, NOT instruction decoding or a mnemonic allowlist.
+// Recheck at execution entry as well as at transport admission. No fallback.
+static int validate_program(const unsigned char *program, size_t size)
+{
+    if (size != FIXTURE_BYTES || size % 4 != 0 || rvzr_fixture_size != FIXTURE_BYTES ||
+        memcmp(program, rvzr_fixture, FIXTURE_BYTES) != 0) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    return 0;
 }
 
 // Three pages: inaccessible guard / one payload page / inaccessible guard.
@@ -106,8 +119,14 @@ static int region_open(region_t *region, size_t page, size_t bytes)
     return 0;
 }
 
-static int execute_fixed(result_t *result, size_t page, const input_t *input)
+static int execute_fixed(result_t *result, size_t page, const input_t *input,
+                         const unsigned char *program)
 {
+    if (validate_program(program, FIXTURE_BYTES) != 0) {
+        result->error = errno;
+        result->stage = CODE_MAPPING;
+        return 1; // No allocations, protection changes, or invocation.
+    }
     region_t data = {0}, code = {0};
     int error = 0;
     result->stage = DATA_MAPPING;
@@ -121,7 +140,7 @@ static int execute_fixed(result_t *result, size_t page, const input_t *input)
     }
     if (region_open(&code, page, rvzr_fixture_size) != 0)
         goto failed;
-    memcpy(code.payload, rvzr_fixture, rvzr_fixture_size);
+    memcpy(code.payload, program, FIXTURE_BYTES);
     result->stage = PUBLICATION;
     // GCC's target-supported cache synchronization, including required barriers.
     // This is not cache eviction for measurement; it publishes newly written code.
@@ -166,11 +185,14 @@ static int64_t monotonic_ms(void)
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-// Snapshot one raw production fragment. Read at most one excess byte; require
-// EOF, handle short reads, and bound a stalled pipe. No mappings exist yet.
-static int read_input(int fd, input_t *input)
+// Fixed-size packets only. The caller supplies expected+1 bytes of owned space.
+// Read at most one excess byte, require EOF, and bound a stalled pipe.
+static int read_packet(int fd, unsigned char *wire, size_t expected)
 {
-    unsigned char wire[FRAGMENT_BYTES + 1];
+    if (expected != FRAGMENT_BYTES && expected != FRAGMENT_BYTES + FIXTURE_BYTES) {
+        errno = EINVAL;
+        return -1;
+    }
     size_t used = 0;
     int64_t start = monotonic_ms();
     for (;;) {
@@ -184,19 +206,45 @@ static int read_input(int fd, input_t *input)
         if (ready < 0) return -1;
         if (ready == 0) { errno = ETIMEDOUT; return -1; }
         if (pending.revents & POLLNVAL) { errno = EBADF; return -1; }
-        ssize_t count = read(fd, wire + used, sizeof(wire) - used);
+        ssize_t count = read(fd, wire + used, expected + 1 - used);
         if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (count < 0) return -1;
         if (count == 0) break;
         used += (size_t)count; // read() returns at most the requested remaining capacity.
-        if (used == sizeof(wire)) { errno = E2BIG; return -1; }
+        if (used == expected + 1) { errno = E2BIG; return -1; }
     }
-    if (used != FRAGMENT_BYTES) { errno = EINVAL; return -1; }
+    if (used != expected) { errno = EINVAL; return -1; }
+    return 0;
+}
+
+static int decode_input(const unsigned char *wire, input_t *input)
+{
     for (size_t i = MAIN_BYTES; i < FRAGMENT_BYTES; ++i) {
         if (i >= SELECTOR_OFFSET && i < SELECTOR_OFFSET + 8) continue;
         if (wire[i] != 0) { errno = ENOTSUP; return -1; }
     }
     memcpy(input->bytes, wire, FRAGMENT_BYTES); // Publish only a completely validated snapshot.
+    return 0;
+}
+
+static int read_input(int fd, input_t *input)
+{
+    unsigned char wire[FRAGMENT_BYTES + 1];
+    if (read_packet(fd, wire, FRAGMENT_BYTES) != 0) return -1;
+    return decode_input(wire, input);
+}
+
+// No length/count/address fields: exactly 36 approved code bytes, then the
+// unchanged 12288-byte raw input. Neither output is published on rejection.
+static int read_program_input(int fd, unsigned char *program, input_t *input)
+{
+    unsigned char wire[FIXTURE_BYTES + FRAGMENT_BYTES + 1];
+    input_t validated;
+    if (read_packet(fd, wire, FIXTURE_BYTES + FRAGMENT_BYTES) != 0 ||
+        validate_program(wire, FIXTURE_BYTES) != 0 ||
+        decode_input(wire + FIXTURE_BYTES, &validated) != 0) return -1;
+    memcpy(program, wire, FIXTURE_BYTES);
+    *input = validated;
     return 0;
 }
 
@@ -263,12 +311,22 @@ static int failure(const char *stage, int error, int signal_number, int timed_ou
 
 static int runner_main(int argc, char **argv)
 {
-    if (argc != 3 || strcmp(argv[1], "--input-format") != 0)
+    if ((argc != 3 && argc != 5) || strcmp(argv[1], "--input-format") != 0)
         return failure("arguments: --input-format rvzr-inputdata-raw-v1 required", EINVAL, 0, 0, 0);
     if (strcmp(argv[2], INPUT_FORMAT) != 0)
         return failure("unsupported_input_format", ENOTSUP, 0, 0, 0);
+    int generated = argc == 5;
+    if (generated && (strcmp(argv[3], "--program-format") != 0 ||
+                      strcmp(argv[4], PROGRAM_FORMAT) != 0))
+        return failure("unsupported_program_format", ENOTSUP, 0, 0, 0);
     input_t input;
-    if (read_input(STDIN_FILENO, &input) != 0)
+    unsigned char received[FIXTURE_BYTES];
+    const unsigned char *program = rvzr_fixture;
+    if (generated) {
+        if (read_program_input(STDIN_FILENO, received, &input) != 0)
+            return failure("program_request", errno, 0, 0, 0);
+        program = received;
+    } else if (read_input(STDIN_FILENO, &input) != 0)
         return failure("input", errno, 0, 0, 0);
     long page_value = sysconf(_SC_PAGESIZE);
     size_t span;
@@ -284,7 +342,9 @@ static int runner_main(int argc, char **argv)
         return failure("result_mapping", errno, 0, 0, 0);
     printf("{\"kind\":\"metadata\",\"fixture\":\"b34a-fixed-body-v1\","
            "\"input_format\":\"" INPUT_FORMAT "\","
-           "\"architecture\":\"aarch64\",\"page_size\":%zu,\"kernel\":", page);
+           "\"program_source\":\"%s\",\"architecture\":\"aarch64\","
+           "\"page_size\":%zu,\"kernel\":", generated ? "approved-generated" : "embedded-reference",
+           page);
     json_string(system.release);
     puts("}");
     int outcome = 0;
@@ -318,7 +378,7 @@ static int runner_main(int argc, char **argv)
                 result->error = errno;
                 _exit(1);
             }
-            _exit(execute_fixed(result, page, &input));
+            _exit(execute_fixed(result, page, &input, program));
         }
         int status = 0, timed_out = 0;
         int wait_error = wait_bounded(child, &status, &timed_out);

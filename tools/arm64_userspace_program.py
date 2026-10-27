@@ -1,0 +1,83 @@
+"""Export exactly one reviewed Revizor template; not a general ELF/code validator.
+
+The approved concrete bytes establish the register, branch and memory properties
+documented in README.arm64-userspace.md. Python rejects relocation entries/deviating
+artifacts; C independently compares received bytes with its assembled reference.
+No public program-path or generic ELF execution interface is provided.
+"""
+
+from io import BytesIO
+
+from elftools.common.exceptions import ELFError
+from elftools.elf.elffile import ELFFile
+
+from rvzr.tc_components.test_case_code import TestCaseProgram
+
+
+PROGRAM_FORMAT = "rvzr-b34a-body-v1"
+APPROVED_PROGRAM = bytes.fromhex(
+    "1f0000f1 60000054 610180d2 02000014 c10280d2 "
+    "820640f8 2300028b 830600f8 c0035fd6")
+_NOP = bytes.fromhex("1f2003d5")
+_APPROVED_SECTION = _NOP * 3 + APPROVED_PROGRAM[:-4] + _NOP * 4
+_MAX_ELF_BYTES = 65536
+
+
+def _approved_section(raw: bytes) -> tuple[int, bytes]:
+    if len(raw) < 64 or len(raw) > _MAX_ELF_BYTES or raw[:7] != b"\x7fELF\x02\x01\x01":
+        raise ValueError("Expected a bounded little-endian ELF64 object")
+    elf = ELFFile(BytesIO(raw))
+    if elf["e_machine"] != "EM_AARCH64" or elf["e_type"] != "ET_REL":
+        raise ValueError("Expected an AArch64 relocatable object")
+    if elf.num_segments() != 0 or not 1 <= elf.num_sections() <= 16:
+        raise ValueError("Unsupported ELF structure")
+    candidates = []
+    for section in elf.iter_sections():
+        if section["sh_type"] in ("SHT_REL", "SHT_RELA") and section["sh_size"]:
+            raise ValueError("Relocations are unsupported, including unresolved symbols")
+        if section["sh_flags"] & 0x800:  # SHF_COMPRESSED: never decompress input.
+            raise ValueError("Compressed sections are unsupported")
+        if section.name == ".data.main":
+            candidates.append(section)
+        elif section["sh_flags"] & 2 and section["sh_size"]:  # SHF_ALLOC
+            raise ValueError("Extra allocated sections are unsupported")
+    if len(candidates) != 1:
+        raise ValueError("Expected exactly one .data.main section")
+    section = candidates[0]
+    if section["sh_type"] != "SHT_PROGBITS" or section["sh_size"] != 60:
+        raise ValueError("Unsupported section type/extent")
+    payload = section.data()
+    if payload != _APPROVED_SECTION:
+        raise ValueError("Only the exact reviewed B3.4a section is approved")
+    return section["sh_offset"], payload
+
+
+def export_approved_program(test_case: TestCaseProgram) -> bytes:
+    """Return actual ELF body bytes [12,44), plus the approved RET X30.
+
+    Accept only an assembled one-actor B3.4a TestCaseProgram and a bounded,
+    little-endian AArch64 ET_REL object with no relocations or extra allocations.
+    All template section bytes, metadata extent and measurement symbols must
+    match. Unsupported/malformed artifacts raise ValueError, never execute.
+    """
+    if not isinstance(test_case, TestCaseProgram) or test_case.n_actors() != 1:
+        raise ValueError("Exactly one actor is supported")
+    sections = test_case.get_sections()
+    if len(sections) != 1 or sections[0].name != "main" or sections[0].owner.get_id() != 0:
+        raise ValueError("Exactly the main actor section is supported")
+    try:
+        obj = test_case.get_obj()
+        if obj.symbol_table() != [(0, 0, 0, 0), (0, 0, 1, 0), (0, 44, 0, 1), (0, 44, 2, 0)]:
+            raise ValueError("Unsupported measurement/function symbols")
+        with open(obj.obj_path, "rb") as file:
+            raw = file.read(_MAX_ELF_BYTES + 1)
+        offset, payload = _approved_section(raw)
+        metadata = sections[0].get_elf_data()
+        if metadata["offset"] != offset or metadata["size"] != 60:
+            raise ValueError("Stale or incompatible section metadata")
+        program = payload[12:44] + APPROVED_PROGRAM[-4:]
+        if program != APPROVED_PROGRAM:
+            raise ValueError("Program identity mismatch")
+        return program
+    except (OSError, ELFError, AssertionError, IndexError, KeyError, OverflowError) as error:
+        raise ValueError("Invalid or unassembled program artifact") from error
