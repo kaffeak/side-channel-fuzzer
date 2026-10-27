@@ -169,6 +169,13 @@ jobs:
           python -m unittest tests.unit_arm64_generated_campaign -v
 
 
+      - name: Verify ARM64 ADD-derived address dependencies
+        run: |
+          set -euo pipefail
+          python -c "import unicorn; print('Unicorn version:', unicorn.__version__)"
+          python -m unittest tests.unit_arm64_add_address -v
+
+
       - name: Verify ARM64 speculative taint and boosting
         run: |
           set -euo pipefail

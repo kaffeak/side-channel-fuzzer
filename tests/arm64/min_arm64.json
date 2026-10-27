@@ -199,9 +199,7 @@
       {"dest": false, "src": true, "comment": "64-bit general-purpose source register (field \"rn\")", "type_": "REG", "width": 64, "values": ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30", "x31"]},
       {"dest": false, "src": true, "comment": "bitmask immediate (field \"n:imms:immr\")", "type_": "IMM", "values": ["bitmask"], "width": 64}
     ],
-    "implicit_operands": [
-      {"type_": "FLAGS", "width": 0, "src": false, "dest": false, "values": ["w", "", "", "w", "w", "", "", "", "w"]}
-    ]
+    "implicit_operands": []
   },
   {"name": "eor", "category": "general-bitwise", "is_control_flow": false,
     "operands": [
