@@ -4,6 +4,10 @@ This standalone utility investigates a timer, not cache leakage. It does not use
 Revizor, PMU registers, cache-maintenance instructions, speculative execution,
 kernel modules, or other processes' memory. It requires no root privileges.
 
+For the bounded, repeated native Fedora Asahi M3 Pro experiment, follow
+[the B3.5c target protocol](README.m3-timer-protocol.md). It reuses this utility
+and verifier without changing their measurement algorithm.
+
 Build on AArch64 Linux:
 
 ```sh

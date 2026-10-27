@@ -418,7 +418,11 @@ jobs:
             *) echo "Expected a native AArch64 GCC toolchain" >&2; exit 1 ;;
           esac
 
-          printf 'Repository commit: %s\n' "$(git rev-parse HEAD)"
+          
+          repo_commit="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)"
+          test "$repo_commit" = "$GITHUB_SHA"
+          printf 'Repository commit: %s\n' "$repo_commit"
+
           printf 'Workflow commit: %s\nContainer: %s\n' "$GITHUB_SHA" "$CONTAINER_IMAGE"
           printf 'Target kernel: %s\nHost kernel: %s\nHost page size: %s\n' \
             "$KERNEL_RELEASE" "$(uname -r)" "$(getconf PAGESIZE)"
