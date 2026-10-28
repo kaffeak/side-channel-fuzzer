@@ -9,9 +9,10 @@ arbitrary-program loader, PMU access, timer, cache observer,
 kernel-module dependency, speculative model, or production executor integration.
 Do not extend its command line to accept arbitrary machine code.
 
-B3.5f passed native Ubuntu AArch64 CI on a 4K-page kernel (user-reported):
-31 tests, 38 executions/oracle/model matches, including 16 generated-byte executions.
-B3.5g's additional family needs a new native CI run. Cross-compilation,
+B3.5i passed native Ubuntu AArch64 CI on a 4K-page kernel (user-reported):
+45 tests, 102 executions/oracle/model matches, five images, and the additional
+seq/cond correspondence regressions. For first target runs, use the
+[M3 experiment runbook](README.m3-experiment-runbook.md). Cross-compilation,
 Unicorn execution, and host mocks do not establish native execution. Fedora Asahi
 M3 Pro execution and its memory-protection policy remain unverified.
 
@@ -289,8 +290,8 @@ The oracle is parameterized by the **requested template constants**, not by
 decoding C output. It selects `b` if X0==0 else `a` and computes `(word+marker)
 modulo 2^64. X0 retains the selector, X2 the initial word, X4-X7 remain zero,
 and NZCV remains the original CMP result. Actual local Unicorn states match
-every entry. New native-family results remain pending; prior fixed-image native
-results do not validate these new streams.
+every entry. B3.5g's native CI also passed these comparisons, as reported by the
+user; physical M3/Fedora Asahi results remain unverified.
 
 | Constants (fallthrough / taken) | SHA-256 of actual 36-byte generated image |
 | --- | --- |
@@ -319,9 +320,10 @@ Source-copy tests check varying received bytes at simulated 4K/16K page sizes;
 these are not native page-permission measurements. Tests cover every single-bit
 restriction, not all multi-bit programs; the equality/mask rule defines admission.
 
-The 36-test module should produce 102 successful native executions (old 38 + new
-64), with 102 oracle and model comparisons, once native CI is run. On x86-64 it
-has three explicit native-only skips. No new workflow step or dependency is needed.
+The 36-test execution module passed 102 native executions (old 38 + new 64), with
+102 oracle and model comparisons, in user-reported native CI. It now runs alongside
+the nine B3.5i correspondence tests (45 total). On x86-64 the execution module has
+three explicit native-only skips. No new workflow step or dependency is needed.
 For host validation, from the repo root (cross-binutils required):
 
 ```bash
@@ -487,7 +489,9 @@ module)** step in the existing `arm64-baseline` job runs:
 set -euo pipefail
 test "$(uname -m)" = aarch64
 gcc --version
-RVZR_REQUIRE_NATIVE=1 python -m unittest tests.unit_arm64_userspace_execution -v
+RVZR_REQUIRE_NATIVE=1 python -m unittest \
+  tests.unit_arm64_userspace_execution \
+  tests.unit_arm64_location_correspondence -v
 ```
 
 No CI changes or new dependencies are needed for B3.5g. It uses the already

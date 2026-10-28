@@ -15,14 +15,13 @@ cache observer until its independent evidence gates pass.
 | Evidence level | Established | Not established |
 | --- | --- | --- |
 | Source inspection | Concrete instruction admission, fixed raw input subset, guarded allocations, RW-to-RX publication, ABI trampoline, child/result lifetime, model interfaces described below. | Actual target OS permissions, counter behavior, cache state, predictor state or timing accuracy. |
-| Native AArch64 CI, reported with this task | B3.5g: 36/36 tests, 102 native architectural executions and 102 oracle/production sequential-Unicorn matches; five program images. Ubuntu AArch64, 4096-byte pages, `7.0.0-1017-azure`. | M3 Pro execution, 16-KiB execution, physical speculation, a physical observer or detection of leakage. The complete 2^32 MOVZ constant-pair family was not executed. |
+| Native AArch64 CI, user-reported through B3.5j | B3.5i: 45/45 tests, including 102 native architectural executions, 102 oracle/production sequential-Unicorn matches, and the new seq/cond typed-trace correspondence regressions. Five program images; Ubuntu AArch64 with 4096-byte pages (B3.5g reported `7.0.0-1017-azure`). | M3 Pro execution, 16-KiB execution, physical speculation, a physical observer or detection of leakage. The complete 2^32 MOVZ constant-pair family was not executed. |
 | Existing software/model evidence | B3.4a-f model tests cover sequential and conditional-speculation traces, taints, boosting and rollback; B3.5g compares architectural state using `seq`, not `cond`. | A model misprediction is not evidence of a hardware misprediction. Successful taint boosting is not itself a physical input-equivalence test. |
 | Required target evidence | Actual Fedora Asahi kernel/page size, M3 identity, allowed CPUs/core identities, architectural compatibility and timer/cache experiments. | None of these target results is inferred from macOS inventory, header compilation or the CI CPU. |
 
 CI results above are user-supplied evidence, not a newly executed or independently
-downloaded CI run. The older [execution README](README.arm64-userspace.md) still
-describes B3.5g native verification as pending; the newer report supersedes that
-status, not its runtime limitations. Existing workflow steps are
+downloaded CI run. The [target runbook](README.m3-experiment-runbook.md) prepares
+separate G1/G2 physical checks without changing their protocols. Existing workflow steps are
 `.github/workflows/arm64-software-baseline.yml:155-163` (architectural tests) and
 `:258-272` (host timer checks/native timer smoke). B3.5i's closure extends only the
 architectural step's selected test modules.
@@ -335,8 +334,8 @@ RVZR_ARM64_BINUTILS_PREFIX=aarch64-linux-gnu- \
 On native ARM64 omit that environment override; no additional dependencies or
 native-executor change are needed. The existing native userspace architectural
 CI step now selects both modules (45 tests), retaining `RVZR_REQUIRE_NATIVE=1`
-so all three native-execution tests must run rather than skip. Native validation
-of the new correspondence module remains pending a successful GitHub Actions run.
+so all three native-execution tests must run rather than skip. B3.5i subsequently
+passed this 45/45 native CI run, as reported by the user; target M3 validation remains pending.
 Tests print JSON records containing actual full typed traces, effective
 configuration, input identities/hashes, image hash and architectural results.
 This supplies software equivalence evidence only: it creates no HTrace and does
@@ -348,8 +347,8 @@ actual model executions in the focused module. The combined regression command
 covering the new module, all existing B3.5d-g tests, B3.4a-f model tests and related
 preparation/trace/serialization/geometry tests ran **270 tests: 267 passed, 3
 native-only skips**. Seven separate ARM64 generator/ISA regressions also passed.
-Flake8, strict mypy, Pylint and `git diff --check` passed. The new tests have not
-yet been verified with native CI's Unicorn 2.1.4; no physical execution was run.
+Flake8, strict mypy, Pylint and `git diff --check` passed. Subsequent user-reported
+native CI with Unicorn 2.1.4 passed all 45 combined tests; no M3 execution is established.
 
 ## 5. Physical observation: evidence required
 
@@ -523,7 +522,7 @@ does not bypass the architectural-compatibility gate.
 
 | Gate | Required evidence / scope | Stop or inconclusive conditions | Still unsupported after passing | Where |
 | --- | --- | --- | --- | --- |
-| G0: architectural CI baseline | Existing 36 tests/102 executions, exact admitted images, oracle and corresponding seq-model agreement, failure admission. Reported passed. | Any mismatch, missing native execution, unsafe publication or admission regression. | Target M3/16K compatibility and physical observations. | Host tests on WSL2; actual instruction execution on native AArch64 CI. |
+| G0: architectural CI baseline | Existing 45 tests/102 executions, exact admitted images, oracle and corresponding seq-model agreement, failure admission and typed correspondence/equivalence regressions. Reported passed. | Any mismatch, missing native execution, unsafe publication or admission regression. | Target M3/16K compatibility and physical observations. | Host tests on WSL2; actual instruction execution on native AArch64 CI. |
 | G1: actual Fedora Asahi architectural compatibility | Record actual OS/kernel/page size/M3 identity; compile and run existing approved architectural tests unprivileged, check all states/repeats/cleanup and actual 16384-byte geometry if present. | Signals, policy rejection, mismatch, unexpected page size or incomplete output; diagnose without disabling protections. | Timer precision, speculation or cache behavior. | Physical M3 Pro Fedora Asahi; generic 16K CI could supply additional, non-M3 evidence. |
 | G2: M3 timer feasibility | Existing B3.5c protocol: raw JSONL, independent frequency result, CPU/core evidence, overhead/quantization/work sensitivity and repeated sessions. | Trap, backwards/nonadvancing run, CPU mismatch, incomplete output or inconclusive work sensitivity. | Single-load cache discrimination, L1 residency or leakage. | Prepare verifier/format checks on WSL2/CI; actual result only on target. |
 | G3: controlled cache-state discrimination | Separate owned-memory pilot; justified preparation labels, matched controls, interleaving, frozen classifier, held-out errors and stated scope (e.g. operational residency, not automatically L1). | Unknown labels, quantization/noise overlap, excessive held-out errors, drift or observer contamination. | Generated-program observations or Spectre behavior. | Physical M3/core-specific; other ARM CPUs only development evidence. |
@@ -551,10 +550,11 @@ nine software-only regressions cover body PCs, measurement boundaries, RET
 exclusion, main-memory access ranges, unsupported locations and complete typed
 `seq+ct`/`cond+ct` equivalence for the six-input matrix in section 4.4. No execution
 engine, observer, runtime rebinding or new instruction admission was introduced.
-The existing native ARM64 CI step now runs both regression modules together;
-successful native CI validation is the remaining verification step. It will
-establish software correspondence/equivalence on that runner, not physical M3 Pro
-trace equivalence or microarchitectural leakage.
+The existing native ARM64 CI step passed both regression modules together:
+45/45 tests, as reported by the user. This establishes software correspondence/
+equivalence on that runner, not physical M3 Pro trace equivalence or
+microarchitectural leakage. The remaining work is the physical G1/G2 evidence in
+the [experiment runbook](README.m3-experiment-runbook.md).
 
 Open questions that require evidence rather than further instruction expansion:
 
