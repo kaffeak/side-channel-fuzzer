@@ -1,4 +1,4 @@
-"""Fixed native architectural smoke test; no HTrace or random-code execution.
+"""Restricted native architectural smoke tests; no HTrace or random-code execution.
 
 Host tests assemble the real fixture and emulate only the ABI boundary, in
 addition to explicit mocked-syscall ownership tests. Only the native test
@@ -10,6 +10,7 @@ environment an error, so the CI step cannot silently skip execution.
 
 from contextlib import ExitStack
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,10 +30,12 @@ import unicorn.arm64_const as ucc  # type: ignore[import-untyped]
 from rvzr import factory
 from rvzr.isa_spec import InstructionSet
 from rvzr.model_unicorn.model import ARM64UnicornModel
+from rvzr.tc_components.instruction import ImmediateOp, RegisterOp
 from rvzr.tc_components.test_case_data import InputData, save_input_sequence_as_rdbf
 from tests.unit_arm64_contract_slice import software_environment
 from tools.arm64_userspace_input import INPUT_FORMAT, encode_input
-from tools.arm64_userspace_program import APPROVED_PROGRAM, PROGRAM_FORMAT, export_approved_program
+from tools.arm64_userspace_program import (
+    APPROVED_PROGRAM, FAMILY_FORMAT, PROGRAM_FORMAT, export_approved_program, validate_program)
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +46,7 @@ _FLAGS = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]
 _U64 = (1 << 64) - 1
 _INPUT_ARGS = ["--input-format", INPUT_FORMAT]
 _PROGRAM_ARGS = [*_INPUT_ARGS, "--program-format", PROGRAM_FORMAT]
+_FAMILY_PAIRS = ((0, 65535), (65535, 0), (32768, 32767), (1, 256))
 _BAD_ARGUMENTS: tuple[list[str], ...] = (
     [], ["untrusted.bin"], ["--input-format", "rdbf"],
     ["--input-format", "rvzr-inputdata-raw-v2"])
@@ -62,10 +66,11 @@ def restricted_inputs() -> list[InputData]:
     return result
 
 
-def expected_state(input_: InputData) -> tuple[list[int], int, bytes]:
+def expected_state(input_: InputData,
+                   constants: tuple[int, int] = (11, 22)) -> tuple[list[int], int, bytes]:
     """Independent arithmetic/memory oracle using semantic fields, not adapter offsets."""
     selector, word = int(input_[0]["gpr"][0]), int(input_[0]["main"][0])
-    marker = 22 if selector == 0 else 11
+    marker = constants[1] if selector == 0 else constants[0]
     registers = [selector, marker, word, (marker + word) & _U64, 0, 0, 0, 0]
     flags = 0x60000000 if selector == 0 else (0xa0000000 if selector >> 63 else 0x20000000)
     memory = bytearray(input_[0]["main"].tobytes())
@@ -181,6 +186,116 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
     def test_received_program_copy_source_16k(self) -> None:
         self.host_scenario(15)
 
+    def test_family_received_copy_source_both_page_sizes(self) -> None:
+        self.host_scenario(17)
+        self.host_scenario(18)
+
+    def test_family_bit_policy_parity_without_execution(self) -> None:
+        # Independent bit-position oracle: exactly 32 of the 288 bits may vary.
+        # No malformed program is passed to a native executable or Unicorn.
+        raw_input = encode_input(restricted_inputs()[0])
+        accepted = 0
+        for bit in range(288):
+            changed = bytearray(APPROVED_PROGRAM)
+            changed[bit // 8] ^= 1 << (bit % 8)
+            program = bytes(changed)
+            allowed = 69 <= bit <= 84 or 133 <= bit <= 148
+            if allowed:
+                validate_program(program, FAMILY_FORMAT)
+                accepted += 1
+            else:
+                with self.assertRaises(ValueError):
+                    validate_program(program, FAMILY_FORMAT)
+            run = subprocess.run([str(self.host_binary), "decode-family"],
+                                 input=program + raw_input, capture_output=True,
+                                 check=False, timeout=5)
+            self.assertEqual(run.returncode, 0 if allowed else 1, (bit, run.stderr))
+            if allowed:
+                self.assertEqual(json.loads(run.stdout)["program_hex"], program.hex())
+            else:
+                run = subprocess.run([str(self.host_binary), "admission", *_INPUT_ARGS,
+                                      "--program-format", FAMILY_FORMAT], input=program + raw_input,
+                                     capture_output=True, check=False, timeout=5)
+                self.assertEqual(run.returncode, 1, (bit, run.stderr))
+        self.assertEqual(accepted, 32)
+        for constants in ((0, 0), (65535, 65535), (11, 22), *_FAMILY_PAIRS):
+            boundary_program = bytearray(APPROVED_PROGRAM)
+            for offset, constant in zip((8, 16), constants):
+                struct.pack_into("<I", boundary_program, offset, 0xd2800001 | (constant << 5))
+            validate_program(bytes(boundary_program), FAMILY_FORMAT)
+            for mode in ("decode-family", "decode-program"):
+                run = subprocess.run([str(self.host_binary), mode],
+                                     input=bytes(boundary_program) + raw_input,
+                                     capture_output=True, check=False, timeout=5)
+                expected_return = 0 if mode == "decode-family" or constants == (11, 22) else 1
+                self.assertEqual(run.returncode, expected_return, run.stderr)
+        print("Family bit policy: 32 permitted, 256 forbidden single-bit changes; "
+              "7 boundary pairs; host C parsing only, zero program execution")
+
+    def test_family_transport_rejects_invalid_requests_without_execution(self) -> None:
+        with software_environment(self.directory):
+            invalid = self.program_rejections(APPROVED_PROGRAM,
+                                              encode_input(restricted_inputs()[0]))
+        # Four single-byte flips now fall inside the permitted immediate fields.
+        for offset in (9, 10, 17, 18):
+            del invalid[f"changed-byte-{offset}"]
+        for name, wire in invalid.items():
+            with self.subTest(request=name):
+                for mode in ("decode-family", "admission"):
+                    args = [str(self.host_binary), mode]
+                    if mode == "admission":
+                        args += [*_INPUT_ARGS, "--program-format", FAMILY_FORMAT]
+                    run = subprocess.run(args, input=wire, capture_output=True,
+                                         check=False, timeout=5)
+                    self.assertEqual(run.returncode, 1, (name, run.stderr))
+        for arguments in (["--input-format", "rdbf", "--program-format", FAMILY_FORMAT],
+                          [*_INPUT_ARGS, "--program-format", "rvzr-b34a-movz16-v2"]):
+            run = subprocess.run([str(self.host_binary), "admission", *arguments],
+                                 input=b"", capture_output=True, check=False, timeout=5)
+            self.assertEqual(run.returncode, 1, run.stderr)
+        for size in (0, 1, 32, 35, 37, 40):
+            with self.assertRaises(ValueError):
+                validate_program((APPROVED_PROGRAM + bytes(4))[:size], FAMILY_FORMAT)
+        with self.assertRaises(ValueError):
+            validate_program(APPROVED_PROGRAM, "unsupported")
+
+    def test_family_real_generation_model_and_repeatability(self) -> None:
+        hashes = set()
+        with software_environment(self.directory):
+            for constants in _FAMILY_PAIRS:
+                model = self.make_sequential_model(constants)
+                case = model.state.current_test_case()
+                program = export_approved_program(case, FAMILY_FORMAT)
+                digest = hashlib.sha256(program).hexdigest()
+                hashes.add(digest)
+                # Every immutable byte must match; each variable word is independently specified.
+                expected = bytearray(APPROVED_PROGRAM)
+                for offset, constant in zip((8, 16), constants):
+                    struct.pack_into("<I", expected, offset, 0xd2800001 | (constant << 5))
+                self.assertEqual(program, bytes(expected))
+                with self.assertRaises(ValueError):
+                    export_approved_program(case)  # Legacy policy was not relaxed.
+                repeated = self.make_sequential_model(constants)
+                self.assertEqual(export_approved_program(repeated.state.current_test_case(),
+                                                         FAMILY_FORMAT), program)
+                for input_ in restricted_inputs():
+                    run = subprocess.run([str(self.host_binary), "decode-family"],
+                                         input=program + encode_input(input_), capture_output=True,
+                                         check=False, timeout=5)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertEqual(json.loads(run.stdout)["program_hex"], program.hex())
+                for _ in range(2):
+                    for input_ in restricted_inputs():
+                        self.assert_model_state(model, input_, constants)
+                print("Generated MOVZ16 family:", json.dumps({
+                    "fallthrough": constants[0], "taken": constants[1], "sha256": digest,
+                    "program_hex": program.hex(), "unicorn_executions": 16,
+                    "expected_x3": [expected_state(item, constants)[0][3]
+                                    for item in restricted_inputs()],
+                }, sort_keys=True))
+        self.assertEqual(len(hashes), 4)
+        self.assertNotIn(hashlib.sha256(APPROVED_PROGRAM).hexdigest(), hashes)
+
     def test_export_actual_generated_program_and_decode_transport(self) -> None:
         with software_environment(self.directory):
             model = self.make_sequential_model()
@@ -286,17 +401,21 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
                 invalid.append(bytes(changed))
             for raw in invalid:
                 obj.write_bytes(raw)
-                with self.assertRaises(ValueError):
-                    export_approved_program(case)
+                for program_format in (PROGRAM_FORMAT, FAMILY_FORMAT):
+                    with self.assertRaises(ValueError):
+                        export_approved_program(case, program_format)
             obj.write_bytes(original)
-            with patch.object(case, "n_actors", return_value=2), self.assertRaises(ValueError):
-                export_approved_program(case)
+            with patch.object(case, "n_actors", return_value=2):
+                for program_format in (PROGRAM_FORMAT, FAMILY_FORMAT):
+                    with self.assertRaises(ValueError):
+                        export_approved_program(case, program_format)
             source = self.directory / "unresolved.s"
             source.write_text(Path(case.asm_path()).read_text()
                               + "\n.reloc .function_0, R_AARCH64_ABS64, unresolved_symbol\n")
             subprocess.run(["as", str(source), "-o", str(obj)], check=True, timeout=10)
-            with self.assertRaisesRegex(ValueError, "Relocations"):
-                export_approved_program(case)
+            for program_format in (PROGRAM_FORMAT, FAMILY_FORMAT):
+                with self.assertRaisesRegex(ValueError, "Relocations"):
+                    export_approved_program(case, program_format)
 
     def test_execution_entry_rechecks_program_before_allocation(self) -> None:
         self.host_scenario(16)
@@ -483,26 +602,47 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
                          (0, 22, 7, 29, 0, 0, 0, 0, 0x60000000, 0))
         self.assertEqual(bytes(em.mem_read(main, 4096)), struct.pack("<Q", 29) + bytes(4088))
 
-    def make_sequential_model(self) -> ARM64UnicornModel:
+    def make_sequential_model(self,
+                              constants: tuple[int, int] = (11, 22)) -> ARM64UnicornModel:
         """Within software_environment: production generator/ELF, fixture and seq model."""
         # Importing the class would collect its test again; module import just reuses input setup.
         # pylint: disable-next=import-outside-toplevel
         from tests import unit_arm64_contract_slice as slice_tests
 
         helper = slice_tests.ARM64ContractSliceTest()
-        case = helper.assemble_case(self.directory)
-        fixture, _ = self.assemble_fixture()
-        with open(case.get_obj().obj_path, "rb") as file:
-            section = ELFFile(file).get_section_by_name(".data.main")
-            assert section is not None
-            self.assertEqual(fixture[:-4], section.data()[12:44])
+        if constants == (11, 22):
+            case = helper.assemble_case(self.directory)
+            fixture, _ = self.assemble_fixture()
+            with open(case.get_obj().obj_path, "rb") as file:
+                section = ELFFile(file).get_section_by_name(".data.main")
+                assert section is not None
+                self.assertEqual(fixture[:-4], section.data()[12:44])
+        else:
+            template = self.directory / "family.asm"
+            template.write_text((_ARM / "asm/contract_slice.asm").read_text()
+                                .replace("mov x1, #11", f"mov x1, #{constants[0]}")
+                                .replace("mov x1, #22", f"mov x1, #{constants[1]}"))
+            case = factory.get_program_generator(1, InstructionSet(
+                str(_ARM / "min_arm64.json"))).create_test_case_from_template(str(template))
+            for pc, constant in zip((20, 28), constants):
+                inst = case.get_obj().instruction_map()[0][pc]
+                self.assertEqual(inst.name, "mov")
+                destination, immediate = inst.operands
+                assert isinstance(destination, RegisterOp) and isinstance(immediate, ImmediateOp)
+                self.assertEqual((destination.value, destination.width, destination.src,
+                                  destination.dest), ("x1", 64, False, True))
+                self.assertEqual(int(immediate.value.removeprefix("#")), constant)
+                self.assertTrue(immediate.src)
+                self.assertFalse(immediate.dest)
+                self.assertFalse(inst.implicit_operands)  # No flag dependency or write.
         model = factory.get_model((0x109000, 0x200000))
         assert isinstance(model, ARM64UnicornModel)
         model.load_test_case(case)
         return model
 
-    def assert_model_state(self, model: ARM64UnicornModel, input_: InputData) -> None:
-        expected_regs, expected_flags, expected_memory = expected_state(input_)
+    def assert_model_state(self, model: ARM64UnicornModel, input_: InputData,
+                           constants: tuple[int, int] = (11, 22)) -> None:
+        expected_regs, expected_flags, expected_memory = expected_state(input_, constants)
         model.trace_test_case([input_], nesting=1)
         registers = [ucc.UC_ARM64_REG_X0, ucc.UC_ARM64_REG_X1,
                      ucc.UC_ARM64_REG_X2, ucc.UC_ARM64_REG_X3,
@@ -526,12 +666,16 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
             self.assertNotEqual(expected_state(inputs[0])[0], expected_state(inputs[4])[0])
 
     def native_result(self, binary: Path, input_: InputData, model: ARM64UnicornModel,
-                      program: bytes | None = None) -> tuple[list[int], int, bytes]:
+                      program: bytes | None = None,
+                      constants: tuple[int, int] = (11, 22)) -> tuple[list[int], int, bytes]:
         # This helper is used only by native tests with approved programs.
         if program is not None:
-            self.assertEqual(program, APPROVED_PROGRAM)
+            validate_program(program, FAMILY_FORMAT if constants != (11, 22) else PROGRAM_FORMAT)
         wire = encode_input(input_) if program is None else program + encode_input(input_)
         arguments = _INPUT_ARGS if program is None else _PROGRAM_ARGS
+        if constants != (11, 22):
+            self.assertIsNotNone(program)
+            arguments = [*_INPUT_ARGS, "--program-format", FAMILY_FORMAT]
         run = subprocess.run([str(binary), *arguments], input=wire,
                              capture_output=True, check=False, timeout=10)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -542,6 +686,8 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
         self.assertEqual(records[0]["input_format"], INPUT_FORMAT)
         self.assertEqual(records[0]["fixture"], "b34a-fixed-body-v1")
         self.assertEqual(records[0]["architecture"], "aarch64")
+        self.assertEqual(records[0]["program_format"],
+                         FAMILY_FORMAT if constants != (11, 22) else PROGRAM_FORMAT)
         self.assertEqual(records[0]["program_source"],
                          "embedded-reference" if program is None else "approved-generated")
         self.assertEqual(records[-1], {"kind": "complete", "status": "ok", "cases": 1})
@@ -552,20 +698,43 @@ class ARM64UserspaceExecutionTest(unittest.TestCase):  # pylint: disable=too-man
         self.assertEqual(row["status"], "ok")
         self.assertEqual(row["sp_mod16"], 0)
         actual = (row["x0_x7"], row["nzcv"], bytes.fromhex(row["main_hex"]))
-        self.assertEqual(actual, expected_state(input_))
+        self.assertEqual(actual, expected_state(input_, constants))
         for name in ("data_base", "code_base"):
             address = int(row[name], 16)
             self.assertGreater(address, 0)
             self.assertEqual(address % records[0]["page_size"], 0)
         self.assertGreaterEqual(abs(int(row["code_base"], 16) - int(row["data_base"], 16)),
                                 3 * records[0]["page_size"])
-        self.assert_model_state(model, input_)
+        self.assert_model_state(model, input_, constants)
         print("Native architectural state:", json.dumps(
-            {"selector": row["selector"], "initial_word": row["initial_word"],
+            {"constants": constants, "selector": row["selector"],
+             "initial_word": row["initial_word"],
              "x0_x7": row["x0_x7"], "nzcv": row["nzcv"], "sp_mod16": row["sp_mod16"],
              "kernel": records[0]["kernel"], "page_size": records[0]["page_size"]},
             sort_keys=True))
         return actual
+
+    @unittest.skipUnless(_NATIVE, "Actual AArch64 Linux CPU required; no emulated native success")
+    def test_native_generated_family_against_oracle_and_model(self) -> None:
+        binary = self.directory / "architectural-smoke"
+        subprocess.run(["gcc", *_FLAGS, str(_TOOLS / "arm64_architectural_smoke.c"),
+                        str(_TOOLS / "arm64_architectural_fixture.S"), "-o", str(binary)],
+                       check=True, timeout=30)
+        hashes = set()
+        with software_environment(self.directory):
+            for constants in _FAMILY_PAIRS:
+                model = self.make_sequential_model(constants)
+                program = export_approved_program(model.state.current_test_case(), FAMILY_FORMAT)
+                hashes.add(hashlib.sha256(program).hexdigest())
+                inputs = restricted_inputs()
+                first = [self.native_result(binary, item, model, program, constants)
+                         for item in inputs]
+                repeat = [self.native_result(binary, item, model, program, constants)
+                          for item in inputs]
+                self.assertEqual(first, repeat)
+        self.assertEqual(len(hashes), 4)
+        print("Native MOVZ16 family: 4 streams, 64 executions, 64 oracle/model matches; "
+              "0 malformed program executions; SHA256=" + json.dumps(sorted(hashes)))
 
     @unittest.skipUnless(_NATIVE, "Actual AArch64 Linux CPU required; no emulated native success")
     def test_native_fixed_execution_against_oracle_and_sequential_model(self) -> None:

@@ -118,13 +118,16 @@ int main(int argc, char **argv)
         return error;
     }
     assert(argc == 2);
-    if (strcmp(argv[1], "decode") == 0 || strcmp(argv[1], "decode-program") == 0) {
+    if (strcmp(argv[1], "decode") == 0 || strcmp(argv[1], "decode-program") == 0 ||
+        strcmp(argv[1], "decode-family") == 0) {
         input_t input;
         unsigned char program[FIXTURE_BYTES];
         memset(program, 0xa5, sizeof(program));
         memset(&input, 0xa5, sizeof(input));
-        int generated = strcmp(argv[1], "decode-program") == 0;
-        int error = generated ? read_program_input(STDIN_FILENO, program, &input)
+        int generated = strcmp(argv[1], "decode") != 0;
+        program_policy_t policy = strcmp(argv[1], "decode-family") == 0
+            ? MOVZ16_FAMILY : EXACT_PROGRAM;
+        int error = generated ? read_program_input(STDIN_FILENO, program, &input, policy)
                               : read_input(STDIN_FILENO, &input);
         if (error != 0) {
             // Validation failures do not publish partially filled input state.
@@ -161,7 +164,8 @@ int main(int argc, char **argv)
         unsigned char invalid[FIXTURE_BYTES];
         memcpy(invalid, rvzr_fixture, sizeof(invalid));
         invalid[0] ^= 1;
-        assert(execute_fixed(&result, 4096, &input, invalid) != 0);
+        assert(execute_fixed(&result, 4096, &input, invalid, EXACT_PROGRAM) != 0);
+        assert(execute_fixed(&result, 4096, &input, invalid, MOVZ16_FAMILY) != 0);
         assert(result.error == ENOTSUP && acquisitions == 0 && invocations == 0 && live == 0);
     } else if (scenario == 9 || scenario == 10) {
         pid_t child = fork();
@@ -201,9 +205,18 @@ int main(int argc, char **argv)
         expected_input = &input;
         unsigned char received[FIXTURE_BYTES];
         memcpy(received, rvzr_fixture, sizeof(received));
+        if (scenario == 17 || scenario == 18) {
+            // MOVZ X1,#0 / MOVZ X1,#65535. Source and RX bytes must be this snapshot.
+            const unsigned char first[] = {1, 0, 0x80, 0xd2};
+            const unsigned char second[] = {0xe1, 0xff, 0x9f, 0xd2};
+            memcpy(received + 8, first, 4);
+            memcpy(received + 16, second, 4);
+        }
         expected_program = scenario >= 14 ? received : rvzr_fixture;
-        size_t page = scenario == 8 || scenario == 13 || scenario == 15 ? 16384 : 4096;
-        int error = execute_fixed(&result, page, &input, expected_program);
+        size_t page = scenario == 8 || scenario == 13 || scenario == 15 || scenario == 18
+            ? 16384 : 4096;
+        int error = execute_fixed(&result, page, &input, expected_program,
+                                 scenario >= 17 ? MOVZ16_FAMILY : EXACT_PROGRAM);
         int success = scenario == 0 || scenario == 8 || scenario >= 12;
         assert(error == (success ? 0 : 1));
         assert(invocations == ((success || scenario == 6) ? 1U : 0U));

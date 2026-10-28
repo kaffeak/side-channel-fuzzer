@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// One approved architectural program only. No general code loader or HTrace output.
+// Reviewed fixed body or MOVZ-immediate family. No general code loader or HTrace output.
 #define _GNU_SOURCE
 #if !defined(__linux__) || (!defined(__aarch64__) && !defined(RVZR_ARCH_HOST_TEST))
 #error "Native AArch64 Linux required; RVZR_ARCH_HOST_TEST is for the mock unit harness only."
@@ -28,6 +28,8 @@ enum { MAIN_BYTES = 4096, FIXTURE_BYTES = 36, DEADLINE_MS = 2000,
        FRAGMENT_BYTES = 12288, SELECTOR_OFFSET = 8192 };
 #define INPUT_FORMAT "rvzr-inputdata-raw-v1"
 #define PROGRAM_FORMAT "rvzr-b34a-body-v1"
+#define FAMILY_FORMAT "rvzr-b34a-movz16-v1"
+typedef enum { EXACT_PROGRAM, MOVZ16_FAMILY } program_policy_t;
 typedef struct { unsigned char bytes[FRAGMENT_BYTES]; } input_t;
 _Static_assert(MAIN_BYTES <= SELECTOR_OFFSET && SELECTOR_OFFSET + 8 <= FRAGMENT_BYTES,
                "serialized field bounds");
@@ -66,16 +68,27 @@ static uint64_t read_le64(const unsigned char *bytes)
     return value;
 }
 
-// An exact concrete-program gate, NOT instruction decoding or a mnemonic allowlist.
+// Concrete encoding gate, NOT instruction decoding or a mnemonic allowlist.
 // Recheck at execution entry as well as at transport admission. No fallback.
-static int validate_program(const unsigned char *program, size_t size)
+static int validate_program(const unsigned char *program, size_t size, program_policy_t policy)
 {
     if (size != FIXTURE_BYTES || size % 4 != 0 || rvzr_fixture_size != FIXTURE_BYTES ||
-        memcmp(program, rvzr_fixture, FIXTURE_BYTES) != 0) {
-        errno = ENOTSUP;
-        return -1;
+        (policy != EXACT_PROGRAM && policy != MOVZ16_FAMILY)) goto rejected;
+    for (size_t offset = 0; offset < FIXTURE_BYTES; offset += 4) {
+        uint32_t word = 0, reference = 0;
+        for (unsigned j = 0; j < 4; ++j) {
+            word |= (uint32_t)program[offset + j] << (8 * j);
+            reference |= (uint32_t)rvzr_fixture[offset + j] << (8 * j);
+        }
+        // Only imm16 bits [20:5] at the two MOVZ X1, #imm16, LSL #0 sites.
+        uint32_t variable = policy == MOVZ16_FAMILY && (offset == 8 || offset == 16)
+            ? UINT32_C(0x001fffe0) : 0;
+        if ((word & ~variable) != (reference & ~variable)) goto rejected;
     }
     return 0;
+rejected:
+    errno = ENOTSUP;
+    return -1;
 }
 
 // Three pages: inaccessible guard / one payload page / inaccessible guard.
@@ -120,9 +133,9 @@ static int region_open(region_t *region, size_t page, size_t bytes)
 }
 
 static int execute_fixed(result_t *result, size_t page, const input_t *input,
-                         const unsigned char *program)
+                         const unsigned char *program, program_policy_t policy)
 {
-    if (validate_program(program, FIXTURE_BYTES) != 0) {
+    if (validate_program(program, FIXTURE_BYTES, policy) != 0) {
         result->error = errno;
         result->stage = CODE_MAPPING;
         return 1; // No allocations, protection changes, or invocation.
@@ -236,12 +249,13 @@ static int read_input(int fd, input_t *input)
 
 // No length/count/address fields: exactly 36 approved code bytes, then the
 // unchanged 12288-byte raw input. Neither output is published on rejection.
-static int read_program_input(int fd, unsigned char *program, input_t *input)
+static int read_program_input(int fd, unsigned char *program, input_t *input,
+                              program_policy_t policy)
 {
     unsigned char wire[FIXTURE_BYTES + FRAGMENT_BYTES + 1];
     input_t validated;
     if (read_packet(fd, wire, FIXTURE_BYTES + FRAGMENT_BYTES) != 0 ||
-        validate_program(wire, FIXTURE_BYTES) != 0 ||
+        validate_program(wire, FIXTURE_BYTES, policy) != 0 ||
         decode_input(wire + FIXTURE_BYTES, &validated) != 0) return -1;
     memcpy(program, wire, FIXTURE_BYTES);
     *input = validated;
@@ -316,14 +330,17 @@ static int runner_main(int argc, char **argv)
     if (strcmp(argv[2], INPUT_FORMAT) != 0)
         return failure("unsupported_input_format", ENOTSUP, 0, 0, 0);
     int generated = argc == 5;
+    program_policy_t policy = EXACT_PROGRAM;
     if (generated && (strcmp(argv[3], "--program-format") != 0 ||
-                      strcmp(argv[4], PROGRAM_FORMAT) != 0))
+                      (strcmp(argv[4], PROGRAM_FORMAT) != 0 &&
+                       strcmp(argv[4], FAMILY_FORMAT) != 0)))
         return failure("unsupported_program_format", ENOTSUP, 0, 0, 0);
+    if (generated && strcmp(argv[4], FAMILY_FORMAT) == 0) policy = MOVZ16_FAMILY;
     input_t input;
     unsigned char received[FIXTURE_BYTES];
     const unsigned char *program = rvzr_fixture;
     if (generated) {
-        if (read_program_input(STDIN_FILENO, received, &input) != 0)
+        if (read_program_input(STDIN_FILENO, received, &input, policy) != 0)
             return failure("program_request", errno, 0, 0, 0);
         program = received;
     } else if (read_input(STDIN_FILENO, &input) != 0)
@@ -342,8 +359,9 @@ static int runner_main(int argc, char **argv)
         return failure("result_mapping", errno, 0, 0, 0);
     printf("{\"kind\":\"metadata\",\"fixture\":\"b34a-fixed-body-v1\","
            "\"input_format\":\"" INPUT_FORMAT "\","
-           "\"program_source\":\"%s\",\"architecture\":\"aarch64\","
+           "\"program_source\":\"%s\",\"program_format\":\"%s\",\"architecture\":\"aarch64\","
            "\"page_size\":%zu,\"kernel\":", generated ? "approved-generated" : "embedded-reference",
+           policy == MOVZ16_FAMILY ? FAMILY_FORMAT : PROGRAM_FORMAT,
            page);
     json_string(system.release);
     puts("}");
@@ -378,7 +396,7 @@ static int runner_main(int argc, char **argv)
                 result->error = errno;
                 _exit(1);
             }
-            _exit(execute_fixed(result, page, &input, program));
+            _exit(execute_fixed(result, page, &input, program, policy));
         }
         int status = 0, timed_out = 0;
         int wait_error = wait_bounded(child, &status, &timed_out);
