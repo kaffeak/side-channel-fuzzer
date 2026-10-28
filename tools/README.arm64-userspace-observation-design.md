@@ -23,8 +23,9 @@ CI results above are user-supplied evidence, not a newly executed or independent
 downloaded CI run. The older [execution README](README.arm64-userspace.md) still
 describes B3.5g native verification as pending; the newer report supersedes that
 status, not its runtime limitations. Existing workflow steps are
-`.github/workflows/arm64-software-baseline.yml:155-161` (architectural tests) and
-`:256-270` (host timer checks/native timer smoke). This milestone changes neither.
+`.github/workflows/arm64-software-baseline.yml:155-163` (architectural tests) and
+`:258-272` (host timer checks/native timer smoke). B3.5i's closure extends only the
+architectural step's selected test modules.
 
 The target inventory reports 128-byte lines, 64-KiB Sawtooth efficiency-core and
 128-KiB Everest performance-core L1 D-caches. Treat these as **macOS-reported
@@ -239,6 +240,117 @@ history explicitly; the current single-input contract is not automatically a
 model of arbitrary training sequences. Reproducible differences are candidate
 contract violations pending confound checks, not automatically vulnerabilities.
 
+### 4.4 B3.5i: software-only correspondence and equivalence regressions
+
+Source snapshot for this addition: `a6d0c81` before the scoped B3.5i changes.
+The passive policy in [arm64_userspace_correspondence.py](arm64_userspace_correspondence.py)
+and [focused tests](../tests/unit_arm64_location_correspondence.py) now exercise
+the restricted correspondence above. They are not connected to any executor.
+The PC functions accept only normalized body offsets; macros, `pc44`, `pc56`,
+native RET offset 32, unaligned/unknown offsets and absolute PCs raise ValueError.
+Tests compare every mapped instruction against the real generated ELF and actual
+exported native image, in both directions. Actual raw tracer addresses are checked
+against the production normalized typed trace, rather than merely assuming the
+coordinate origin.
+
+`main_access_to_offset(address,size,main_base)` requires the entire nonempty
+half-open access inside the declared 4096-byte main region, using unsigned 64-bit
+values and representable interval ends. For normalized model memory entries the
+base is **4096**, not the input-format main offset zero; for model absolute
+addresses it is `layout.get_data_addr(DataArea.MAIN,0)`; for native coordinates it
+is a synthetic/caller-supplied main base. Tests cover every byte, every contained
+eight-byte starting offset, the whole payload, cross-end accesses, negative/
+overflowing values, incorrect types and unsupported regions. They do not infer
+mapping ownership, provenance, liveness or physical permissions from arithmetic;
+numerically aliased coordinate systems cannot be distinguished automatically.
+This range policy does not authorize instructions of other access widths.
+
+One fixed program is generated through the production template/assembler/ELF
+path: original B3.4a constants 11/22, exported by the unchanged exact-image policy.
+Its 36-byte SHA-256 is
+`e475be5271ab347616fa2a5d83c4184b82e62d6f344337bfe2b96f2f90c59441`.
+No new image, MOVZ family expansion or native execution is introduced.
+
+Both configurations explicitly freeze ARM64, Unicorn backend, normal trace mode,
+one actor, `ct`, nesting **1**, maximum speculation window **32**, no handled
+faults, and synthetic bases `(0x109000,0x200000)`. The execution clause alone is
+selected separately as `seq` or `cond`; tests check the actual speculator type and
+effective nesting/window values. InputData is explicitly zero-initialized; only
+X0 and the first main word are set. Exact raw serialization and userspace input
+admission are checked. Each input is actually retraced individually, then retraced
+again in reverse order; no C-trace reuse, hash comparison or boosting is involved.
+
+| Input | X0 / initial main word | Final X0,X1,X2,X3 under both configurations | Typed-trace class, independently computed per configuration |
+| --- | --- | --- | --- |
+| A | 0 / 7 | 0,22,7,29 | Taken |
+| B | 0 / 19 | 0,22,19,41 | Taken |
+| C | 1 / 7 | 1,11,7,18 | Not taken |
+| D | 1 / 18 | 1,11,18,29 | Not taken |
+| E | 2 / 7 | 2,11,7,18 | Not taken |
+| F | 0 / 7, byte-identical to A | 0,22,7,29 | Taken |
+
+For each configuration the complete typed equality classes are `{A,B,F}` and
+`{C,D,E}`. The **contents** of seq and cond traces differ; equality classes are
+not inferred from each other. A/B are equal-C with different serialized data and
+architectural results. A/F are identical inputs with repeatable complete results.
+C/E have equal-C despite differing X0. A/D have equal stored words and full main
+memory but different registers and non-equal C-traces. No pair is claimed to have
+equal complete architectural state merely because its stored result is equal.
+
+Complete observed typed traces follow (`pcN` means `CTraceEntry("pc",N)`, `memN`
+means `CTraceEntry("mem",N)`; these are ordered lists, not sets or bitmaps):
+
+```text
+seq, taken (A/B/F):
+pc12 pc16 pc28 pc32 mem4096 pc36 pc40 mem4096 pc44
+
+seq, not taken (C/D/E):
+pc12 pc16 pc20 pc24 pc32 mem4096 pc36 pc40 mem4096 pc44
+
+cond, taken (A/B/F):
+pc12 pc16 pc20 pc24 pc32 mem4096 pc36 pc40 mem4096 pc44 pc56
+pc28 pc32 mem4096 pc36 pc40 mem4096 pc44
+
+cond, not taken (C/D/E):
+pc12 pc16 pc28 pc32 mem4096 pc36 pc40 mem4096 pc44 pc56
+pc20 pc24 pc32 mem4096 pc36 pc40 mem4096 pc44
+```
+
+The conditional trace retains the wrong-path join, measurement-end event and
+model exit-NOP `pc56`, then the correct continuation after model rollback. This
+is real production-model output, consistent with the audit's **limited** mapping
+domain, not a contradiction of its body mapping. `pc56` must be rejected by the
+body mapper; it is not native RET. The two `pc44` observations must not be silently
+deduplicated. Compared X0-X3/NZCV/main agree between seq and cond and
+reset correctly across repetitions; nesting and pending faults return to zero.
+This is software contract behavior, not physical misprediction evidence.
+
+Run on x86-64 WSL2 with cross-binutils (or native AArch64 with native binutils):
+
+```bash
+RVZR_ARM64_BINUTILS_PREFIX=aarch64-linux-gnu- \
+  python -m unittest tests.unit_arm64_location_correspondence -v
+```
+
+On native ARM64 omit that environment override; no additional dependencies or
+native-executor change are needed. The existing native userspace architectural
+CI step now selects both modules (45 tests), retaining `RVZR_REQUIRE_NATIVE=1`
+so all three native-execution tests must run rather than skip. Native validation
+of the new correspondence module remains pending a successful GitHub Actions run.
+Tests print JSON records containing actual full typed traces, effective
+configuration, input identities/hashes, image hash and architectural results.
+This supplies software equivalence evidence only: it creates no HTrace and does
+not validate live native addresses, instruction retirement, page permissions,
+cache-state equivalence, measurement boundary placement or M3 behavior.
+
+Local WSL2 validation (Unicorn 1.0.3): all **9 new tests passed**, including 37
+actual model executions in the focused module. The combined regression command
+covering the new module, all existing B3.5d-g tests, B3.4a-f model tests and related
+preparation/trace/serialization/geometry tests ran **270 tests: 267 passed, 3
+native-only skips**. Seven separate ARM64 generator/ISA regressions also passed.
+Flake8, strict mypy, Pylint and `git diff --check` passed. The new tests have not
+yet been verified with native CI's Unicorn 2.1.4; no physical execution was run.
+
 ## 5. Physical observation: evidence required
 
 ### 5.1 Available starting point and conceptual candidates
@@ -434,13 +546,15 @@ compatibility run a separate G1 result; neither experiment proves the other.
 If Linux is not yet available, report that dependency rather than substitute CI
 timings or macOS measurements.
 
-**Smallest coding task if physical access is delayed:** add host-only tests of
-the location-correspondence policy for the existing approved image: body PCs,
-measurement-end event, RET exclusion, supported main byte ranges and rejection of
-unmapped logical regions, together with explicit selected-contract typed equality
-for a small admitted input pair. These can use real model traces without creating
-an execution engine, observer, runtime rebinding or new instruction admission.
-This task is proposed, not implemented here.
+**B3.5i implemented and locally validated:** the passive correspondence policy and
+nine software-only regressions cover body PCs, measurement boundaries, RET
+exclusion, main-memory access ranges, unsupported locations and complete typed
+`seq+ct`/`cond+ct` equivalence for the six-input matrix in section 4.4. No execution
+engine, observer, runtime rebinding or new instruction admission was introduced.
+The existing native ARM64 CI step now runs both regression modules together;
+successful native CI validation is the remaining verification step. It will
+establish software correspondence/equivalence on that runner, not physical M3 Pro
+trace equivalence or microarchitectural leakage.
 
 Open questions that require evidence rather than further instruction expansion:
 
@@ -459,6 +573,8 @@ Open questions that require evidence rather than further instruction expansion:
 * Would the chosen speculation contract permit or expose the measured behavior?
   Forced wrong-path Unicorn execution is not a measurement of an M3 predictor.
 
-This milestone adds only this document. No timer, observer, model, executor,
-kernel, CI or instruction-admission behavior changes, and no hardware execution
-is performed as part of the audit.
+B3.5h added only this document; B3.5i adds the passive policy, focused software
+tests, section 4.4 above and selection of the new module in the existing native
+CI step. No timer, observer, model, executor, kernel or instruction-admission
+behavior changes. No hardware execution was performed during local B3.5i work;
+the existing native architectural tests remain enabled in CI.

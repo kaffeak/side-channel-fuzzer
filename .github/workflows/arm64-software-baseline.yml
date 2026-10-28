@@ -158,7 +158,9 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = aarch64
           gcc --version
-          RVZR_REQUIRE_NATIVE=1 python -m unittest tests.unit_arm64_userspace_execution -v
+          RVZR_REQUIRE_NATIVE=1 python -m unittest \
+            tests.unit_arm64_userspace_execution \
+            tests.unit_arm64_location_correspondence -v
 
 
       - name: Verify ARM64 conditional-speculation contract
