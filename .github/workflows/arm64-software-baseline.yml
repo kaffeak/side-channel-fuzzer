@@ -271,6 +271,19 @@ jobs:
           python tools/verify_arm64_timer.py "$RUNNER_TEMP/arm64-timer" \
             --output "$RUNNER_TEMP/arm64-timer.jsonl"
 
+      - name: Compile G3a and verify synthetic protocol (no cache experiment)
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -fanalyzer \
+            tools/cacheObservation/pilot.c tools/cacheObservation/platform_linux.c \
+            tools/cacheObservation/probe.S -o "$RUNNER_TEMP/g3a"
+          objdump -d "$RUNNER_TEMP/g3a" > "$RUNNER_TEMP/g3a.disassembly.txt"
+          python -c 'import pathlib, sys; from tools.cacheObservation.disassembly import check; check(pathlib.Path(sys.argv[1]).read_text())' \
+            "$RUNNER_TEMP/g3a.disassembly.txt"
+          python -m unittest tests.unit_cache_observation -v
+
 
 
   arm64-kernel-16k:
