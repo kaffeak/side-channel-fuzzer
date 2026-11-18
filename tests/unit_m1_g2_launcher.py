@@ -86,6 +86,8 @@ class LauncherTest(unittest.TestCase):
         self.g.BASELINE = baseline  # Test fixture only; native CLI has no override.
         script = repo / "tools/rvzr_m1_g2.sh"
         shutil.copyfile(LAUNCHER, script)
+        for name in self.g.SUPPORT:
+            shutil.copyfile(ROOT / name, repo / name)
         script.chmod(0o755)
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
         self.commit(repo, "synthetic later launcher commit")
@@ -235,10 +237,10 @@ class LauncherTest(unittest.TestCase):
                 patch.object(self.g, "collect") as collect:
             self.assertEqual(self.g.main(["--check"]), 1)
         collect.assert_not_called()
-        directory = next(path for path in self.base.iterdir() if path.is_dir())
+        directory = next(self.base.glob("*/*/evidence"))
         self.g.verify_manifest(directory)
         self.assertIn("BLOCKED", (directory / "STATUS.txt").read_text())
-        self.assertTrue(Path(str(directory) + ".tar.gz.sha256").is_file())
+        self.assertTrue(Path(str(self.g.artifacts(directory)["archive"]) + ".sha256").is_file())
 
     def test_missing_tool_blocks_collect_without_build_or_measurement(self):
         software = self.base / "software"
@@ -315,11 +317,11 @@ class LauncherTest(unittest.TestCase):
                 patch.object(self.g, "verify_archive",
                              side_effect=self.g.Blocked("synthetic archive error")):
             self.assertEqual(self.g.main(["--session", "1"]), 1)
-        directory = next(path for path in self.base.iterdir() if path.is_dir())
+        directory = next(self.base.glob("*/*/evidence"))
         self.assertEqual((directory / "raw.txt").read_text(), "synthetic retained raw")
         self.g.verify_manifest(directory)
-        self.assertTrue(Path(str(directory) + ".seal-failure.json").exists())
-        receipt = json.loads(Path(str(directory) + ".receipt.json").read_text())
+        self.assertTrue(self.g.artifacts(directory)["failure"].exists())
+        receipt = json.loads(self.g.artifacts(directory)["receipt"].read_text())
         self.assertEqual(receipt["actual_launcher_exit"], 1)
 
     def test_addendum_does_not_change_sealed_set(self):
@@ -353,7 +355,7 @@ class LauncherTest(unittest.TestCase):
                 patch.object(self.g, "install_signals"), \
                 patch.object(self.g, "collect", side_effect=interrupted):
             self.assertEqual(self.g.main(["--session", "1"]), 130)
-        directory = next(path for path in self.base.iterdir() if path.is_dir())
+        directory = next(self.base.glob("*/*/evidence"))
         self.assertIn("INTERRUPTED", (directory / "STATUS.txt").read_text())
         self.g.verify_manifest(directory)
         self.g.LAST_SIGNAL = None
@@ -369,17 +371,21 @@ class LauncherTest(unittest.TestCase):
                 patch.object(self.g, "collect", return_value="COMPLETE_RAW_SESSION; synthetic"), \
                 patch.object(self.g, "seal", side_effect=seal_signal):
             self.assertEqual(self.g.main(["--session", "2"]), 143)
-        directory = next(path for path in self.base.iterdir()
-                         if path.is_dir() and path != directory)
-        receipt = json.loads(Path(str(directory) + ".receipt.json").read_text())
+        directory = next(path for path in self.base.glob("*/*/evidence") if path != directory)
+        receipt = json.loads(self.g.artifacts(directory)["receipt"].read_text())
         self.assertEqual(receipt["state"], "INTERRUPTED_DURING_SEAL")
         self.assertEqual(receipt["actual_launcher_exit"], 143)
         self.g.verify_manifest(directory)
 
-    def synthetic_collection(self, directory, session, fail_at=None):
+    def synthetic_collection(self, directory, session, fail_at=None, events=None):
         revision = {"baseline_commit": self.g.BASELINE, "execution_commit": "a" * 40,
                     "launcher_sha256": self.g.sha(LAUNCHER),
                     "sources_sha256": {name: self.g.sha(ROOT / name) for name in self.g.FROZEN}}
+        if hasattr(self.g, "SUPPORT"):
+            revision["support_sources_sha256"] = {name: self.g.sha(ROOT / name)
+                                                  for name in self.g.SUPPORT}
+        if events is None:
+            events = []
         env = {"uname": ["Linux", "synthetic-host", "synthetic-kernel"], "page_size": 16384,
                "cpus": {str(cpu): {"midr": str(value[0])} for cpu, value in self.g.MIDRS.items()}}
         measured = []
@@ -398,6 +404,7 @@ class LauncherTest(unittest.TestCase):
                 self.assertEqual(command[command.index("--samples") + 1], "128")
                 cpu, loads = int(command[command.index("-c") + 1]), int(command[-1])
                 measured.append((cpu, loads))
+                events.append("measurement")
                 raw = synthetic_raw(cpu, loads)
                 if len(measured) == fail_at:
                     code, raw = 124, b"synthetic incomplete prefix\n"
@@ -411,6 +418,9 @@ class LauncherTest(unittest.TestCase):
                 patch.object(self.g, "target", side_effect=environment), \
                 patch.object(self.g, "prerequisites"), \
                 patch.object(self.g, "notes", return_value="SYNTHETIC fixture, no hardware"), \
+                patch.object(self.g, "environment_snapshot",
+                             side_effect=lambda _path, phase: events.append("snapshot-" + phase),
+                             create=True), \
                 patch.object(self.g, "logged", side_effect=synthetic_command):
             state = self.g.collect(directory, session)
         self.g.save(directory / "session.json", {"state": state})
@@ -452,6 +462,136 @@ class LauncherTest(unittest.TestCase):
         last = directory / "raw/cpu-4-loads-32-rep-1.validation.json"
         self.assertEqual(json.loads(last.read_text())["state"], "NOT_ACCEPTED")
         self.assertFalse((directory / "analysis/analysis.jsonl").exists())
+
+    def test_new_hierarchy_unique_reruns_seal_and_addendum(self):
+        with patch.object(self.g, "OUTPUT", self.base):
+            first, second = self.g.new_run("M1-G2-S1"), self.g.new_run("M1-G2-S1")
+            self.assertNotEqual(first.parent, second.parent)
+            self.assertEqual(first.parent.parent, self.base / "M1-G2-S1")
+            self.assertEqual(first.name, "evidence")
+            for session in (first, second):
+                self.assertEqual(self.g.evidence_root(session.parent), session)
+                self.assertEqual(self.g.evidence_root(session), session)
+                self.g.save(session / "session.json", {"state": "synthetic incomplete"})
+                archive = self.g.seal(session)
+                self.assertEqual(archive, session.parent / "evidence.tar.gz")
+                self.g.verify_archive(session, archive)
+                self.g.external_record(self.g.artifacts(session)["receipt"],
+                                       {"actual_launcher_exit": 1})
+            before = self.g.file_hashes(first), self.g.sha(first.parent / "evidence.tar.gz")
+            extra = self.g.new_run("addenda")
+            self.g.addendum(first.parent, "separate late observation", extra)
+            self.g.seal(extra)
+            self.assertEqual(
+                before, (self.g.file_hashes(first), self.g.sha(first.parent / "evidence.tar.gz")))
+            self.assertEqual(json.loads((extra / "addendum.json").read_text())["session"],
+                             str(first))
+
+    def test_new_containers_compare_without_modifying_sessions(self):
+        paths = []
+        with patch.object(self.g, "OUTPUT", self.base):
+            for session in (1, 2):
+                directory = self.g.new_run(f"M1-G2-S{session}")
+                self.synthetic_collection(directory, session)
+                self.g.seal(directory)
+                self.g.external_record(self.g.artifacts(directory)["receipt"],
+                                       {"actual_launcher_exit": 0})
+                paths.append(directory)
+            before = [self.g.file_hashes(path) for path in paths]
+            output = self.g.new_run("comparison")
+            # Both container and explicit evidence paths are accepted.
+            self.g.compare([paths[0].parent, paths[1]], output)
+            self.assertEqual(before, [self.g.file_hashes(path) for path in paths])
+            self.assertEqual(json.loads((output / "work-sensitivity.json").read_text())[
+                "per_cpu"]["0"]["work_sensitivity"], "PASS")
+
+    def test_snapshots_bracket_every_measurement_with_no_monitor_in_loop(self):
+        events = []
+        self.synthetic_collection(self.base, 1, events=events)
+        self.assertEqual(events, ["snapshot-before"] + ["measurement"] * 40 + ["snapshot-after"])
+
+    def test_snapshot_after_failed_measurement_runs_without_retry(self):
+        events = []
+        with self.assertRaises(ValueError):
+            self.synthetic_collection(self.base, 1, fail_at=2, events=events)
+        self.assertEqual(events,
+                         ["snapshot-before", "measurement", "measurement", "snapshot-after"])
+
+    def test_snapshot_worker_optional_errors_and_unknown_termination(self):
+        stem = self.base / "metadata/environment-before"
+
+        def worker(_command, _stem, **kwargs):
+            self.assertEqual(kwargs["limit"], 5)
+            self.g.save(Path(str(stem) + ".stdout"),
+                        {"schema_version": 1, "records": [], "status": "PARTIAL"})
+            self.g.save(Path(str(stem) + ".execution.json"), {"returncode": 0})
+            return 0
+
+        with patch.object(self.g, "logged", side_effect=worker):
+            self.g.environment_snapshot(self.base, "before")
+        summary = self.base / "metadata/environment-before.json"
+        self.assertEqual(json.loads(summary.read_text())["status"], "PARTIAL")
+        for response in ("malformed", "nonzero", "timeout", "unknown"):
+            with self.subTest(response=response):
+                def failed(_command, _stem, **_kwargs):
+                    Path(str(stem) + ".stdout").write_text("malformed")
+                    self.g.save(Path(str(stem) + ".execution.json"),
+                                {"returncode": None if response == "unknown" else -15})
+                    if response in ("timeout", "unknown"):
+                        raise subprocess.TimeoutExpired(["synthetic"], 5)
+                    return 0 if response == "malformed" else 7
+                with patch.object(self.g, "logged", side_effect=failed):
+                    if response == "unknown":
+                        with self.assertRaisesRegex(self.g.Blocked, "termination unknown"):
+                            self.g.environment_snapshot(self.base, "before")
+                    else:
+                        self.g.environment_snapshot(self.base, "before")
+                        result = json.loads(summary.read_text())
+                        self.assertEqual(result["status"], "UNAVAILABLE")
+                        self.assertTrue(result["error"])
+        with patch.object(self.g, "logged", side_effect=self.g.Interrupted(signal.SIGINT)), \
+                self.assertRaises(self.g.Interrupted):
+            self.g.environment_snapshot(self.base, "before")
+
+    def test_manual_notes_are_timestamped_and_separate_from_os_reports(self):
+        for phase, note in (("before", "none observed"), ("after", "not monitored")):
+            with patch.object(self.g, "notes", return_value=note) as prompt:
+                self.g.operator_note(self.base, phase)
+            self.assertIn("unusual events", prompt.call_args.args[0])
+            record = json.loads((self.base / "metadata" / f"operator-{phase}.json").read_text())
+            self.assertEqual(record["status"], "MANUAL")
+            self.assertEqual(record["observation"], note)
+            self.assertTrue(record["observed_utc"])
+            self.assertEqual((self.base / f"notes-{phase}.txt").read_text(), note + "\n")
+
+    def test_offline_analysis_driver_records_its_own_committed_provenance(self):
+        repo, script = self.fixture_repo()
+        output = self.base / "offline-output"
+        output.mkdir()
+        with patch.object(self.g, "REPO", repo), patch.object(self.g, "LAUNCHER", script), \
+                patch.object(self.g, "logged") as execution:
+            self.g.offline_provenance(output)
+        execution.assert_not_called()
+        revision = json.loads((output / "software/revision-offline.json").read_text())
+        self.assertEqual(revision["execution_commit"], self.g.git(repo, "rev-parse", "HEAD")
+                         .decode().strip())
+        self.assertEqual((output / "software/g2-driver.sh").read_bytes(), script.read_bytes())
+        self.assertIn("git-offline-status", [p.name for p in (output / "software").iterdir()])
+
+    def test_helper_source_and_captured_snapshot_drift_are_rejected(self):
+        repo, script = self.fixture_repo()
+        revision = self.g.provenance(repo, script, self.base, "before")
+        helper = repo / self.g.SUPPORT[0]
+        self.assertEqual(revision["support_sources_sha256"][self.g.SUPPORT[0]], self.g.sha(helper))
+        helper.write_text(helper.read_text() + "\n# uncommitted fixture drift\n")
+        with self.assertRaisesRegex(self.g.Blocked, "Clean committed"):
+            self.g.provenance(repo, script, self.base, "dirty-helper")
+        for name in self.g.FROZEN:
+            shutil.copyfile(ROOT / name, self.base / Path(name).name)
+        shutil.copyfile(LAUNCHER, self.base / "g2-driver.sh")
+        shutil.copyfile(helper, self.base / helper.name)
+        with self.assertRaisesRegex(self.g.Blocked, "Helper snapshot changed"):
+            self.g.verify_snapshots(self.base, revision)
 
     def test_operator_notes_use_nonseeking_terminal_streams(self):
         modes = []

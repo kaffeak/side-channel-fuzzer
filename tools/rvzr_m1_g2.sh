@@ -36,6 +36,7 @@ REPO = LAUNCHER.parent.parent
 OUTPUT = Path("/home/safelab/MasterThesis/output/G2")
 FROZEN = ("tools/arm64_timer_calibration.c", "tools/verify_arm64_timer.py",
           "tools/README.m3-timer-protocol.md", "tools/README.m3-experiment-runbook.md")
+SUPPORT = ("tools/experimental_environment.py",)
 MIDRS = {0: (0x611f0221, "Icestorm"), 4: (0x611f0231, "Firestorm")}
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 LAST_SIGNAL = None
@@ -110,7 +111,14 @@ def provenance(repo, launcher, directory, phase, previous=None, binary=None):
             "Launcher differs from execution commit")
     require(git(repo, "ls-tree", "HEAD", relative).startswith(b"100755 "),
             "Commit the launcher with executable mode 100755")
-    result = {"baseline_commit": BASELINE, "execution_commit": commit,
+    support = {}
+    for name in SUPPORT:
+        path = repo / name
+        require(not path.is_symlink() and path.read_bytes() == git(repo, "show", f"HEAD:{name}"),
+                f"Uncommitted environmental helper: {name}")
+        support[name] = sha(path)
+    result = {"support_sources_sha256": support,
+              "baseline_commit": BASELINE, "execution_commit": commit,
               "branch": git(repo, "branch", "--show-current").decode().strip(),
               "launcher_revision": git(repo, "log", "-1", "--format=%H", "--", relative)
               .decode().strip(), "launcher_sha256": sha(launcher), "sources_sha256": hashes}
@@ -373,6 +381,44 @@ def verify_archive(directory, archive):
     require(observed == expected, "Archive checksum/inventory mismatch")
 
 
+def evidence_root(path):
+    """Accept a new run container, its evidence child, or an untouched legacy directory."""
+    path = Path(path).resolve()
+    if (path / "evidence" / "metadata" / "layout.json").is_file():
+        require(not (path / "session.json").exists(), "Ambiguous evidence container")
+        return path / "evidence"
+    return path
+
+
+def artifacts(directory):
+    """Only new evidence has a layout marker. Legacy sibling filenames remain unchanged."""
+    marker = directory / "metadata" / "layout.json"
+    if marker.is_file():
+        layout = json.loads(marker.read_text())
+        require(layout["layout_version"] == 1 and layout["experiment"] == "G2"
+                and directory.name == "evidence" and layout["run_id"] == directory.parent.name,
+                "Invalid evidence layout")
+        return {"receipt": directory.parent / "receipt.json",
+                "failure": directory.parent / "seal-failure.json",
+                "archive": directory.parent / "evidence.tar.gz"}
+    return {"receipt": Path(str(directory) + ".receipt.json"),
+            "failure": Path(str(directory) + ".seal-failure.json"),
+            "archive": Path(str(directory) + ".tar.gz")}
+
+
+def new_run(label):
+    parent = OUTPUT / label
+    parent.mkdir(parents=True, exist_ok=True)
+    container = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8] + "-", dir=parent))
+    directory = container / "evidence"
+    (directory / "metadata").mkdir(parents=True)
+    save(directory / "metadata" / "layout.json", {
+        "layout_version": 1, "experiment": "G2", "experiment_session": label,
+        "run_id": container.name, "created_utc": now()})
+    return directory
+
+
 def seal(directory):
     hashes = file_hashes(directory)
     with (directory / "SHA256SUMS").open("x") as stream:
@@ -382,7 +428,7 @@ def seal(directory):
     for path in directory.rglob("*"):
         path.chmod(0o500 if path.is_dir() else 0o400)
     directory.chmod(0o500)
-    archive = directory.with_name(directory.name + ".tar.gz")
+    archive = artifacts(directory)["archive"]
     with tarfile.open(archive, "x:gz") as packed:
         packed.add(directory, arcname=directory.name)
     verify_archive(directory, archive)
@@ -430,8 +476,55 @@ def verify_snapshots(directory, revision):
     for name in FROZEN:
         require(sha(directory / Path(name).name) == revision["sources_sha256"][name],
                 f"Snapshot changed: {name}")
+    for name, expected in revision.get("support_sources_sha256", {}).items():
+        require(sha(directory / Path(name).name) == expected, f"Helper snapshot changed: {name}")
     require(sha(directory / "g2-driver.sh") == revision["launcher_sha256"],
             "Launcher snapshot changed")
+
+
+def operator_note(directory, phase):
+    text = notes("Record any unusual events, intentional background activity, "
+                 "physical interruptions or changes in testing conditions. "
+                 "Enter 'none observed' if appropriate, "
+                 "or 'not monitored' for unknown conditions.")
+    (directory / f"notes-{phase}.txt").write_text(text + "\n")
+    metadata = directory / "metadata"
+    metadata.mkdir(exist_ok=True)
+    save(metadata / f"operator-{phase}.json", {
+        "observed_utc": now(), "source": "manual operator report", "phase": phase,
+        "status": "MANUAL", "observation": text})
+
+
+def environment_snapshot(directory, phase):
+    """One synchronous optional worker; return only after it exits or is reaped."""
+    metadata = directory / "metadata"
+    metadata.mkdir(exist_ok=True)
+    stem = metadata / f"environment-{phase}"
+    command = [sys.executable, str(directory / "software" / "experimental_environment.py")]
+    report = {"schema_version": 1, "status": "UNAVAILABLE", "observed_utc": now(),
+              "source": command, "phase": phase, "error": None}
+    termination_known = True
+    try:
+        code = logged(command, stem, limit=5)
+        require(code == 0, f"Environmental worker returned {code}")
+        raw = Path(str(stem) + ".stdout")
+        require(raw.stat().st_size <= 1024 * 1024, "Environmental report too large")
+        report = json.loads(raw.read_bytes())
+        require(report["schema_version"] == 1 and isinstance(report["records"], list),
+                "Invalid environmental report")
+    except Interrupted as error:
+        report["error"] = str(error)
+        raise
+    except Exception as error:
+        report = {"schema_version": 1, "status": "UNAVAILABLE", "observed_utc": now(),
+                  "source": command, "phase": phase, "error": str(error)}
+        execution = Path(str(stem) + ".execution.json")
+        if execution.is_file():
+            termination_known = json.loads(execution.read_text())["returncode"] is not None
+    finally:
+        save(metadata / f"environment-{phase}.json", report)
+    require(termination_known,
+            "Environmental worker termination unknown; cannot isolate measurement")
 
 
 def collect(directory, session):
@@ -442,16 +535,19 @@ def collect(directory, session):
     revision = provenance(REPO, LAUNCHER, software, "before")
     environment = target(software)
     prerequisites(software)
-    for name in FROZEN:
+    for name in (*FROZEN, *SUPPORT):
         dest = software / Path(name).name
         shutil.copyfile(REPO / name, dest)
-        require(sha(dest) == revision["sources_sha256"][name], "Snapshot hash mismatch")
+        expected = {**revision["sources_sha256"], **revision["support_sources_sha256"]}
+        require(sha(dest) == expected[name], "Snapshot hash mismatch")
     shutil.copyfile(LAUNCHER, software / "g2-driver.sh")
     require(sha(software / "g2-driver.sh") == revision["launcher_sha256"],
             "Launcher snapshot drift")
     verify = validator(software / "verify_arm64_timer.py")
+    experiment_id = (directory.parent.name if
+                     (directory / "metadata" / "layout.json").exists() else directory.name)
     save(directory / "methodology.json", {
-        "session": session, "experiment_id": directory.name, "revizor": revision,
+        "session": session, "experiment_id": experiment_id, "revizor": revision,
         "program": "unchanged B3.5c arm64_timer_calibration.c", "inputs": "loads 1/8/32/128",
         "random_seed": "NOT APPLICABLE", "contract": "NOT APPLICABLE",
         "designation": "G2 characterization/replication; held-out cache evaluation NOT APPLICABLE",
@@ -462,9 +558,7 @@ def collect(directory, session):
         "timeout_seconds": 15, "kill_guard_seconds": 2,
         "acceptance": "Per CPU across both sessions: "
                       "min(owned_buffer p50 loads=128) > max(p50 loads=1)"})
-    before = notes(
-        "Before sampling: record AC/battery, background workload and thermal/fan observations")
-    (directory / "notes-before.txt").write_text(before + "\n")
+    operator_note(directory, "before")
     binary = directory / "arm64-timer"
     command = ["gcc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
                str(software / "arm64_timer_calibration.c"), "-o", str(binary)]
@@ -476,23 +570,32 @@ def collect(directory, session):
     verify_snapshots(software, revision)
     provenance(REPO, LAUNCHER, software, "prepared", revision, (binary, fingerprint))
     rows = []
-    for rep, cpu, loads in schedule(session):
-        stem = directory / "raw" / f"cpu-{cpu}-loads-{loads}-rep-{rep}"
-        command = ["timeout", "--verbose", "--kill-after=2s", "15s", "taskset", "-c", str(cpu),
-                   str(binary), "--samples", "128", "--loads", str(loads)]
-        if Path("/usr/bin/time").is_file() and os.access("/usr/bin/time", os.X_OK):
-            command = ["/usr/bin/time", "-v", "-o", str(stem) + ".rusage.txt", *command]
-        else:
-            Path(str(stem) + ".rusage.txt").write_text("GNU time unavailable\n")
-        results = run_trial(command, stem, cpu, loads, verify, environment)
-        rows.extend(dict(row, rep=rep) for row in results)
-        print(f"Session {session}: {len(rows) // 3}/40 validated; cpu={cpu}, loads={loads}",
-              flush=True)
+    try:
+        environment_snapshot(directory, "before")
+        for rep, cpu, loads in schedule(session):
+            stem = directory / "raw" / f"cpu-{cpu}-loads-{loads}-rep-{rep}"
+            command = ["timeout", "--verbose", "--kill-after=2s", "15s", "taskset", "-c", str(cpu),
+                       str(binary), "--samples", "128", "--loads", str(loads)]
+            if Path("/usr/bin/time").is_file() and os.access("/usr/bin/time", os.X_OK):
+                command = ["/usr/bin/time", "-v", "-o", str(stem) + ".rusage.txt", *command]
+            else:
+                Path(str(stem) + ".rusage.txt").write_text("GNU time unavailable\n")
+            results = run_trial(command, stem, cpu, loads, verify, environment)
+            rows.extend(dict(row, rep=rep) for row in results)
+            print(f"Session {session}: {len(rows) // 3}/40 validated; cpu={cpu}, loads={loads}",
+                  flush=True)
+    finally:
+        environment_snapshot(directory, "after")
     with (directory / "analysis" / "analysis.jsonl").open("x") as stream:
         for row in rows:
             stream.write(json.dumps(row, sort_keys=True) + "\n")
-    after = notes("After sampling: record operator observations")
-    (directory / "notes-after.txt").write_text(after + "\n")
+    operator_note(directory, "after")
+    identity_after = directory / "metadata" / "identity-after"
+    identity_after.mkdir()
+    after = target(identity_after)
+    require(after["uname"] == environment["uname"]
+            and after["page_size"] == environment["page_size"],
+            "Essential identity changed during measurement")
     verify_snapshots(software, revision)
     provenance(REPO, LAUNCHER, software, "after", revision, (binary, fingerprint))
     return "COMPLETE_RAW_SESSION; cross-session G2 decision PENDING"
@@ -513,17 +616,19 @@ def work_gate(rows):
 
 
 def compare(paths, output):
+    paths = [evidence_root(path) for path in paths]
     require(paths[0] != paths[1], "Two separately launched sessions required")
     rows, commits, environments = [], [], []
     for session, path in enumerate(paths, 1):
         verify_manifest(path)
-        require(not Path(str(path) + ".seal-failure.json").exists(), "Session sealing failed")
-        receipt_path = Path(str(path) + ".receipt.json")
+        related = artifacts(path)
+        require(not related["failure"].exists(), "Session sealing failed")
+        receipt_path = related["receipt"]
         require(Path(str(receipt_path) + ".sha256").read_text().split()[0] == sha(receipt_path),
                 "Receipt integrity mismatch")
         require(json.loads(receipt_path.read_text())["actual_launcher_exit"] == 0,
                 "Session launcher failed or was interrupted")
-        archive = Path(str(path) + ".tar.gz")
+        archive = related["archive"]
         require(Path(str(archive) + ".sha256").read_text().split()[0] == sha(archive),
                 "Archive integrity mismatch")
         verify_archive(path, archive)
@@ -567,10 +672,21 @@ def compare(paths, output):
 
 
 def addendum(path, text, output):
+    path = evidence_root(path)
     verify_manifest(path)
     save(output / "addendum.json", {
         "session": str(path), "manifest_sha256": sha(path / "SHA256SUMS"),
         "recorded_utc": now(), "note": text})
+
+
+def offline_provenance(directory):
+    """Record the current analysis driver separately from the original session identity."""
+    software = directory / "software"
+    software.mkdir()
+    revision = provenance(REPO, LAUNCHER, software, "offline")
+    snapshot = software / "g2-driver.sh"
+    shutil.copyfile(LAUNCHER, snapshot)
+    require(sha(snapshot) == revision["launcher_sha256"], "Analysis driver snapshot drift")
 
 
 def arguments(argv):
@@ -591,10 +707,10 @@ def main(argv):
     args = arguments(argv)
     require(os.geteuid() != 0, "Use an ordinary user")
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    prefix = (f"M1-G2-S{args.session}" if args.session else
-              "M1-G2-preflight" if args.check else "M1-G2-offline")
-    directory = Path(tempfile.mkdtemp(prefix=prefix + "-" + datetime.now(timezone.utc).strftime(
-        "%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8] + "-", dir=OUTPUT))
+    label = (f"M1-G2-S{args.session}" if args.session else "preflight" if args.check
+             else "comparison" if args.compare else "addenda")
+    directory = new_run(label)
+    print(f"Output: {directory.parent}", flush=True)
     state, code, started = "STARTED", 0, now()
     save(directory / "session.json", {"state": state, "started_utc": started})
     install_signals()
@@ -611,9 +727,11 @@ def main(argv):
         elif args.session:
             state = collect(directory, args.session)
         elif args.compare:
+            offline_provenance(directory)
             compare([path.resolve() for path in args.compare], directory)
             state = "OFFLINE_COMPARISON_ONLY"
         else:
+            offline_provenance(directory)
             addendum(args.addendum.resolve(), args.note, directory)
             state = "ADDENDUM_ONLY"
     except (Exception, Interrupted) as error:
@@ -640,7 +758,7 @@ def main(argv):
         except Exception as error:
             code = 1
             # Keep the original tree/archive untouched even after a sealing failure.
-            external_record(OUTPUT / (directory.name + ".seal-failure.json"), {
+            external_record(artifacts(directory)["failure"], {
                 "state": "SEAL_FAILED", "reason": str(error), "recorded_utc": now()})
             print(f"Sealing failed; preserve {directory}: {error}", file=sys.stderr)
         else:
@@ -648,7 +766,7 @@ def main(argv):
         if LAST_SIGNAL != signal_at_seal:
             code = 128 + LAST_SIGNAL
         # Receipt is outside the immutable evidence set and written only once.
-        external_record(OUTPUT / (directory.name + ".receipt.json"), {
+        external_record(artifacts(directory)["receipt"], {
             "actual_launcher_exit": code, "requested_signal": LAST_SIGNAL,
             "state": "INTERRUPTED_DURING_SEAL" if LAST_SIGNAL != signal_at_seal else state,
             "recorded_utc": now()})
