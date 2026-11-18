@@ -175,3 +175,10 @@ just `evidence.tar.gz`. Verify `sha256sum -c evidence.tar.gz.sha256` and
 `sha256sum -c receipt.json.sha256` from its container. Accepted prior G2 measurements
 remain prior findings: this infrastructure still needs physical M1 validation and
 cannot establish cache latency, HTraces or speculation-contract violations.
+
+## Hwmon inventory follow-up
+
+The observed M1 hwmon truncation is being investigated separately. See
+[the audit and one-shot diagnostic](README.hwmon-investigation.md). The existing
+collector's limits and selection behavior remain unchanged pending physical inventory;
+this diagnostic does not repeat G1/G2 or modify their sealed evidence.
