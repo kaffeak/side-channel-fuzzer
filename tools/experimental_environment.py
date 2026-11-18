@@ -15,6 +15,10 @@ import time
 MAX_FILE = 16384
 MAX_RECORDS = 1024
 MAX_JSON = 1024 * 1024
+HWMON_DIRECTORY_ENTRIES = 256
+HWMON_CONTROLLERS = 16
+HWMON_INPUTS = 16
+HWMON_INPUT_PATTERN = re.compile(r"(temp|fan|power|in|curr)[0-9]+_input")
 M1_CORES = {0x611f0221: "Icestorm", 0x611f0231: "Firestorm"}
 
 
@@ -58,7 +62,7 @@ class Reader:
                              "observed_utc": utc(), "status": "UNAVAILABLE" if error else status,
                              "value": None if error else value, "error": error})
 
-    def read(self, source, category, unit, parser=str):
+    def read(self, source, category, unit, parser=str, *, optional=False):
         text = None
         previous = len(self.records)
         try:
@@ -76,8 +80,12 @@ class Reader:
             self.record(category, source, unit, error=f"{type(error).__name__}: {error}")
             if text is not None and len(self.records) > previous:
                 self.records[-1]["raw_diagnostic"] = text[:256]
+            if optional and len(self.records) > previous:
+                self.records[-1].update(optional=True, missing=isinstance(error, FileNotFoundError))
             return None
         self.record(category, source, unit, value)
+        if optional and len(self.records) > previous:
+            self.records[-1].update(optional=True, missing=False)
         return value
 
     def glob(self, pattern, category, limit):
@@ -98,6 +106,51 @@ class Reader:
         if truncated and self.records and self.records[-1]["source"] == pattern:
             self.records[-1]["truncated"] = True
         return sources
+
+    def hwmon_paths(self, directory, pattern, matcher, limit, *, empty_ok=False):
+        """Select from a bounded inventory, retaining known omissions and discovery failures."""
+        paths, examined, error = [], 0, None
+        complete = False
+        try:
+            if time.monotonic() >= self.deadline:
+                raise TimeoutError("Collection deadline exhausted")
+            with os.scandir(self.root / directory.lstrip("/")) as entries:
+                for entry in entries:
+                    if time.monotonic() >= self.deadline:
+                        raise TimeoutError("Collection deadline exhausted")
+                    if examined >= HWMON_DIRECTORY_ENTRIES:
+                        break  # One lookahead entry establishes incomplete discovery.
+                    examined += 1
+                    if matcher.fullmatch(entry.name):
+                        paths.append(directory + "/" + entry.name)
+                else:
+                    complete = True
+        except OSError as failure:
+            error = f"{type(failure).__name__}: {failure}"
+        paths.sort(key=lambda path: [int(part) if part.isdigit() else part
+                                     for part in re.split(r"([0-9]+)", path)])
+        selected, omitted = paths[:limit], paths[limit:]
+        truncated = not complete or bool(omitted)
+        self.limited |= truncated
+        previous = len(self.records)
+        self.record("hwmon", directory + "/" + pattern, "interface paths", selected,
+                    error=error or (None if selected or empty_ok else "No exposed interfaces"))
+        if len(self.records) > previous:
+            self.records[-1].update(discovered=paths, selected=selected, omitted=omitted,
+                                    discovery_complete=complete, entries_examined=examined,
+                                    enumeration_limit=HWMON_DIRECTORY_ENTRIES,
+                                    selection_limit=limit, truncated=truncated)
+        return selected
+
+
+def _completeness(records, limited):
+    unavailable = [row for row in records if row["status"] == "UNAVAILABLE"]
+    missing_labels = sum(row["category"] == "hwmon" and row.get("optional", False)
+                         and row.get("missing", False) for row in unavailable)
+    other = len(unavailable) - missing_labels
+    return {"status_excluding_missing_optional_hwmon_labels":
+            "PARTIAL" if other or limited else "COMPLETE",
+            "missing_optional_hwmon_labels": missing_labels, "other_unavailable_records": other}
 
 
 def runtime(reader, name, unit, query):
@@ -207,13 +260,15 @@ def snapshot(root=Path("/"), *, seconds=2):
         r.read(base + "/temp", "thermal", "millidegrees Celsius", number)
     units = {"temp": "millidegrees Celsius", "fan": "RPM", "power": "microwatts",
              "in": "millivolts", "curr": "milliamps"}
-    for base in r.glob("/sys/class/hwmon/hwmon*", "hwmon", 8):
+    for base in r.hwmon_paths("/sys/class/hwmon", "hwmon*", re.compile(r"hwmon[0-9]+"),
+                              HWMON_CONTROLLERS):
         r.read(base + "/name", "hwmon", "sensor controller name; core mapping UNKNOWN")
-        for source in r.glob(base + "/*_input", "hwmon", 16):
-            match = re.fullmatch(r"(temp|fan|power|in|curr)[0-9]+_input", source.rsplit("/", 1)[1])
-            if match:
-                r.read(source, "hwmon", units[match[1]], number)
-                r.read(source[:-6] + "_label", "hwmon", "optional sensor label; mapping unverified")
+        for source in r.hwmon_paths(base, "*_input", HWMON_INPUT_PATTERN, HWMON_INPUTS,
+                                    empty_ok=True):
+            match = HWMON_INPUT_PATTERN.fullmatch(source.rsplit("/", 1)[1])
+            r.read(source, "hwmon", units[match[1]], number)
+            r.read(source[:-6] + "_label", "hwmon", "optional sensor label; mapping unverified",
+                   optional=True)
 
     def uptime_parser(text):
         value = Decimal(text.split()[0])
@@ -247,8 +302,12 @@ def snapshot(root=Path("/"), *, seconds=2):
     return {"schema_version": 1, "started_utc": started, "finished_utc": utc(),
             "status": "PARTIAL" if any(row["status"] == "UNAVAILABLE" for row in r.records)
             or r.limited else "COMPLETE", "limited": r.limited, "records": r.records,
+            "completeness": _completeness(r.records, r.limited),
             "limits": {"file_bytes": MAX_FILE, "records": MAX_RECORDS,
-                       "cooperative_seconds": seconds, "process_candidates": 66},
+                       "cooperative_seconds": seconds, "process_candidates": 66,
+                       "hwmon_directory_entries": HWMON_DIRECTORY_ENTRIES,
+                       "hwmon_discovery_lookahead": 1, "hwmon_controllers": HWMON_CONTROLLERS,
+                       "hwmon_inputs_per_controller": HWMON_INPUTS},
             "method": "OS reports/derived context only; "
                       "not window telemetry or cache-state evidence",
             "privacy": "No command lines, environments, usernames or device serial numbers"}

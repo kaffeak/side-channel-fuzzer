@@ -79,14 +79,81 @@ identity gate remains blocking, and is repeated after a successful measurement l
 Enumeration is a bounded subset, **not a ranking of the busiest processes**; short-lived
 processes may disappear before reading. Each file read is limited to 16 KiB, the report
 to 1,024 records and 1 MiB JSON, with explicit enumeration caps (32 CPUs, 16 cpufreq
-policies, eight power supplies, 32 thermal zones, eight hwmon controllers with 16 input
-candidates each). The helper has a cooperative two-second deadline. The launcher
+policies, eight power supplies and 32 thermal zones). Hwmon uses a separate discovery
+bound and read allowance, described below. The helper has a cooperative two-second deadline. The launcher
 supervises it with a five-second wait plus the existing bounded termination guards.
 A blocked kernel interface cannot be given a hard real-time guarantee in userspace.
 Optional failures or absent sensors are recorded as PARTIAL/UNAVAILABLE and do not
 alone invalidate timer data. Unknown worker termination is blocking: measurements must
 not start while a monitoring worker could remain alive. Interrupted workers propagate
 interruption; no replacement readings or retries are invented.
+
+### Hwmon selection and completeness
+
+The supplied independently audited M1 inventory contains ten controllers. The reported
+order placed `macsmc_hwmon` last, outside the former eight-controller prefix. The revised
+collector discovers using explicit `scandir()` calls, then selects in numeric path order
+(e.g. hwmon2 before hwmon10). It initially allows **16 controllers** and **16 supported
+inputs per controller**. The original `temp/fan/power/in/currN_input` whitelist and source
+paths remain unchanged. Unsupported attributes are filtered before the selection limit;
+labels retain the driver's original text. This does not add `powerN_average` collection.
+
+Each hwmon directory discovery examines at most **256 entries**, plus one lookahead
+entry to detect that the inventory continues. This bound counts all directory entries,
+including unsupported attributes. The shared cooperative deadline also applies inside
+discovery. Only a fully discovered, unchanged set has order-independent selection;
+if the discovery bound, deadline or an I/O error prevents completion, selection is from
+the observed subset and **cannot** be assumed globally deterministic or exhaustive.
+Standard sysfs class symlinks are followed; broken links remain explicit failures.
+
+Schema version 1, existing `records`, `status`, `value`, `source` and unit fields remain.
+Hwmon enumeration `value` is still a list of selected source paths. Additive metadata:
+
+| Field | Meaning |
+| --- | --- |
+| `discovered` | Sorted supported paths actually discovered; not an assertion about unseen entries. |
+| `selected` | Paths selected for attempted collection. Selection does not guarantee a successful reading. |
+| `omitted` | Discovered paths excluded by the selection limit, including omitted sensor inputs. |
+| `discovery_complete` | Whether directory enumeration reached its end within the bound and deadline. This is not an atomic inventory snapshot. |
+| `entries_examined`, `enumeration_limit`, `selection_limit` | Work performed and the separate discovery/selection allowances. |
+| `truncated` | Discovery was incomplete or known supported paths exceeded the selection allowance. |
+
+Incomplete discovery or known omissions set `limited=true`. Budget exhaustion can
+prevent later records from being retained; selected paths describe the intended read
+set, not proof that every read is present. Directories successfully enumerated with no
+supported inputs are reported as an empty OS_REPORTED path list. An absent/inaccessible
+controller or hwmon class remains UNAVAILABLE. Process enumeration retains its original
+64-candidate policy; its truncation can independently keep `limited=true`.
+
+Optional hwmon label reads add `optional=true` and `missing`. Only `FileNotFoundError`
+marks a label as missing. A missing label still has **UNAVAILABLE**, null value and its
+original error. Permission errors, ENODATA, malformed values and deadlines are not
+reclassified as benign absences. The existing top-level `status` remains conservative:
+any unavailable record, even an optional missing label, still yields PARTIAL.
+
+The additive `completeness` object reports `missing_optional_hwmon_labels`,
+`other_unavailable_records`, and `status_excluding_missing_optional_hwmon_labels`.
+That alternate status excludes only absent optional hwmon labels; it remains PARTIAL
+for all other unavailable records or any `limited` condition. Neither status establishes
+physical coverage or replaces validation. Available labels, OS_REPORTED input values,
+DERIVED context and original UNAVAILABLE readings remain visible independently.
+
+The supplied inventory includes readable NVMe/SMC/battery inputs, controllers without
+supported inputs, and four tas2770 temperature reads returning ENODATA. Those errors
+are preserved rather than retried or turned into zero. Names/labels for NAND, battery,
+Wi-Fi, heatpipe or other components are **not** mapped to Firestorm/Icestorm temperatures.
+
+Software regression fixtures reproduce controller identities/counts and enumeration
+order; their channel names, labels and values are synthetic, not copied physical data.
+An eight-CPU/64-process fixture verifies the original 1,024-record and 1 MiB limits with
+the supplied ten-controller counts, and with sixteen fully populated controllers.
+The extra enumeration and successful SMC reads add work outside measurement windows.
+Fixture timings do not predict native sysfs/SMC latency: the **two-second deadline,
+five-second launcher wait and termination guards are unchanged**, and pathological
+inventories can still exhaust the record or JSON limits. Oversized JSON remains an
+explicit worker failure, preserved by the launcher, rather than a fabricated success.
+The revised collector requires separate physical M1 validation after deployment. No
+completed G1/G2 evidence is changed and no repeat timer measurements are required.
 
 No command lines, environments, usernames or device serial-number interfaces are read.
 Process names/PIDs, hostname, OS and power/sensor labels still disclose context; review
@@ -131,8 +198,8 @@ On the desktop (no native timer execution):
 ```bash
 bash -n tools/rvzr_m1_g2.sh
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest \
-  tests.unit_experimental_environment tests.unit_m1_g2_launcher \
-  tests.unit_arm64_timer_calibration -v
+  tests.unit_experimental_environment tests.unit_hwmon_investigation \
+  tests.unit_m1_g2_launcher tests.unit_arm64_timer_calibration -v
 git diff --check
 ```
 
@@ -178,7 +245,7 @@ cannot establish cache latency, HTraces or speculation-contract violations.
 
 ## Hwmon inventory follow-up
 
-The observed M1 hwmon truncation is being investigated separately. See
-[the audit and one-shot diagnostic](README.hwmon-investigation.md). The existing
-collector's limits and selection behavior remain unchanged pending physical inventory;
-this diagnostic does not repeat G1/G2 or modify their sealed evidence.
+The physical inventory now justifies the correction documented above. See
+[the historical audit and one-shot diagnostic](README.hwmon-investigation.md) for the
+prior behavior and inventory procedure. That audit describes the pre-correction code;
+the revised collector itself has not yet been validated on the physical M1.
