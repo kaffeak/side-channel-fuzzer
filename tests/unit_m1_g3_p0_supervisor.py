@@ -1,19 +1,23 @@
 """Host-only supervision tests. No native worker is ever invoked, including on ARM CI."""
 # pylint: disable=missing-function-docstring,missing-class-docstring,too-many-public-methods
-from contextlib import ExitStack
+# Keep filesystem admission regressions with the supervisor tests they protect.
+# pylint: disable=too-many-lines
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
+import errno
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import tarfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from tools import m1_g3_p0 as p, m1_g3_p0_native as native
 from tools import m1_g3_p0_supervisor as s
@@ -25,6 +29,363 @@ ROOT = Path(__file__).resolve().parents[1]
 def writable(root):
     for path in [root, *root.rglob('*')]:
         path.chmod(0o700 if path.is_dir() else 0o600)
+
+
+class OSReleaseReaderTest(unittest.TestCase):
+    """Private filesystem fixtures only: no worker or supervisor session."""
+    # This class deliberately tests the private, non-ABI filesystem reader.
+    # pylint: disable=protected-access
+
+    RELEASE = (b'NAME="Fedora Linux Asahi Remix"\nID=fedora-asahi-remix\n'
+               b'VERSION_ID=45\nID_LIKE=fedora\n')
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+            prefix='p0-os-release-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.layout(self.root)
+        self.source = self.root / 'etc/os-release'
+        self.vendor = self.root / 'usr/lib/os-release'
+
+    def layout(self, root):
+        (root / 'etc').mkdir(parents=True)
+        (root / 'usr/lib').mkdir(parents=True)
+        (root / 'etc/os-release').write_bytes(self.RELEASE)
+        (root / 'usr/lib/os-release').write_bytes(self.RELEASE)
+
+    def link(self, text='../usr/lib/os-release'):
+        self.source.unlink()
+        self.source.symlink_to(text)
+
+    @contextmanager
+    def descriptors(self):
+        """Track real owned descriptors, retaining real close behavior."""
+        original_open, original_close = os.open, os.close
+        acquired, closed = [], []
+
+        def opened(*args, **kwargs):
+            descriptor = original_open(*args, **kwargs)
+            acquired.append(descriptor)
+            return descriptor
+
+        def close(descriptor):
+            closed.append(descriptor)
+            return original_close(descriptor)
+
+        try:
+            with patch.object(s.os, 'open', side_effect=opened), \
+                    patch.object(s.os, 'close', side_effect=close):
+                yield acquired
+        finally:
+            self.assertEqual(sorted(acquired), sorted(closed))
+            for descriptor in acquired:
+                with self.assertRaises(OSError) as caught:
+                    os.fstat(descriptor)
+                self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    @contextmanager
+    def after_read(self, effect):
+        """Inject deterministic substitutions immediately after the bounded read."""
+        original = os.fdopen
+
+        @contextmanager
+        def opened(*args, **kwargs):
+            with original(*args, **kwargs) as stream:
+                read = stream.read
+
+                def intercepted(size):
+                    self.assertEqual(size, 4097)
+                    result = read(size)
+                    effect()
+                    return result
+
+                with patch.object(stream, 'read', side_effect=intercepted):
+                    yield stream
+
+        with patch.object(s.os, 'fdopen', side_effect=opened):
+            yield
+
+    def test_regular_file_precedes_different_vendor_contents(self):
+        self.vendor.write_bytes(b'ID=other\n')
+        with self.descriptors() as acquired:
+            self.assertEqual(s._os_release(self.root), self.RELEASE)
+        self.assertEqual(len(acquired), 3)
+
+    def test_confirmed_m1_relative_link_and_831_byte_regular_destination(self):
+        data = self.RELEASE + b'#' * (831 - len(self.RELEASE))
+        self.vendor.write_bytes(data)
+        self.link()
+        with self.descriptors() as acquired:
+            self.assertEqual(s._os_release(self.root), data)
+        self.assertEqual(len(acquired), 5)
+
+    def test_absolute_link_uses_fixture_vendor_not_host_files(self):
+        self.vendor.write_bytes(b'private fixture vendor\n')
+        self.link('/usr/lib/os-release')
+        self.assertEqual(s._os_release(self.root), b'private fixture vendor\n')
+
+    def test_missing_source_does_not_fall_back_to_vendor(self):
+        self.source.unlink()
+        with self.descriptors(), self.assertRaises(FileNotFoundError):
+            s._os_release(self.root)
+
+    def test_broken_accepted_vendor_link_fails(self):
+        self.link()
+        self.vendor.unlink()
+        with self.descriptors(), self.assertRaises(FileNotFoundError):
+            s._os_release(self.root)
+
+    def test_vendor_link_chain_is_rejected(self):
+        self.link()
+        self.vendor.rename(self.vendor.with_name('vendor-release'))
+        self.vendor.symlink_to('vendor-release')
+        with self.descriptors(), self.assertRaisesRegex(p.VerificationError, 'Regular OS'):
+            s._os_release(self.root)
+
+    def test_unexpected_destinations_and_loops_are_rejected(self):
+        for text in ('os-release', '/tmp/os-release', '/run/host/os-release',
+                     '/proc/self/fd/0', '../../usr/lib/os-release',
+                     '/usr/lib/./os-release', '../usr/lib/../lib/os-release'):
+            with self.subTest(text=text):
+                self.source.unlink()
+                self.source.symlink_to(text)
+                with self.descriptors(), self.assertRaisesRegex(
+                        p.VerificationError, 'Unexpected /etc/os-release'):
+                    s._os_release(self.root)
+
+    def test_symlinked_parent_directories_are_rejected(self):
+        for name in ('etc', 'usr', 'usr/lib'):
+            with self.subTest(parent=name):
+                root = self.root / ('parent-' + name.replace('/', '-'))
+                self.layout(root)
+                source = root / 'etc/os-release'
+                source.unlink()
+                source.symlink_to('../usr/lib/os-release')
+                parent = root / name
+                alternate = parent.with_name(parent.name + '-real')
+                parent.rename(alternate)
+                parent.symlink_to(alternate.name)
+                with self.descriptors(), self.assertRaises(OSError):
+                    s._os_release(root)
+
+    def test_directory_and_fifo_targets_are_rejected_before_read(self):
+        for vendor in (False, True):
+            for fifo in (False, True):
+                with self.subTest(vendor=vendor, fifo=fifo):
+                    path = self.vendor if vendor else self.source
+                    if vendor and not self.source.is_symlink():
+                        self.link()
+                    path.unlink()
+                    if fifo:
+                        os.mkfifo(path)
+                    else:
+                        path.mkdir()
+                    with self.descriptors(), patch.object(s.os, 'fdopen') as stream, \
+                            self.assertRaisesRegex(p.VerificationError, 'Regular OS'):
+                        s._os_release(self.root)
+                    stream.assert_not_called()
+                    if fifo:
+                        path.unlink()
+                    else:
+                        path.rmdir()
+                    path.write_bytes(self.RELEASE)
+
+    def test_socket_metadata_is_rejected_without_opening_target(self):
+        # No socket bind is needed (or permitted in some desktop sandboxes).
+        metadata = list(self.source.stat())
+        metadata[stat.ST_MODE] = stat.S_IFSOCK | 0o600
+        with self.descriptors(), \
+                patch.object(s.os, 'stat', return_value=os.stat_result(metadata)), \
+                patch.object(s.os, 'fdopen') as stream, \
+                self.assertRaisesRegex(p.VerificationError, 'Regular OS'):
+            s._os_release(self.root)
+        stream.assert_not_called()
+
+    def test_4096_byte_boundary_for_regular_and_vendor_files(self):
+        for linked in (False, True):
+            if linked:
+                self.link()
+            path = self.vendor if linked else self.source
+            for size in (0, 4096, 4097):
+                path.write_bytes(b'x' * size)
+                with self.subTest(linked=linked, size=size), self.descriptors():
+                    if size <= 4096:
+                        self.assertEqual(s._os_release(self.root), b'x' * size)
+                    else:
+                        with self.assertRaisesRegex(p.VerificationError, 'Oversized OS'):
+                            s._os_release(self.root)
+
+    def test_leaf_swap_to_symlink_before_open_fails(self):
+        def opened(name, flags, **kwargs):
+            if name == 'os-release':
+                self.link()
+            return original(name, flags, **kwargs)
+
+        with self.descriptors():
+            original = os.open
+            with patch.object(s.os, 'open', wraps=opened), self.assertRaises(OSError) as caught:
+                s._os_release(self.root)
+        self.assertEqual(caught.exception.errno, errno.ELOOP)
+
+    def test_leaf_swap_to_fifo_before_open_is_nonblocking_and_rejected(self):
+        def opened(name, flags, **kwargs):
+            if name == 'os-release':
+                self.assertTrue(flags & os.O_NONBLOCK)
+                self.source.unlink()
+                os.mkfifo(self.source)
+            return original(name, flags, **kwargs)
+
+        with self.descriptors():
+            original = os.open
+            with patch.object(s.os, 'open', wraps=opened), \
+                    self.assertRaisesRegex(p.VerificationError, 'Regular OS'):
+                s._os_release(self.root)
+
+    def test_regular_inode_swap_before_open_fails(self):
+        replacement = self.source.with_name('replacement')
+        replacement.write_bytes(self.RELEASE)
+
+        def opened(name, flags, **kwargs):
+            if name == 'os-release':
+                os.replace(replacement, self.source)
+            return original(name, flags, **kwargs)
+
+        with self.descriptors():
+            original = os.open
+            with patch.object(s.os, 'open', wraps=opened), \
+                    self.assertRaisesRegex(p.VerificationError, 'changed before open'):
+                s._os_release(self.root)
+
+    def test_in_place_write_during_read_fails_without_timestamp_luck(self):
+        def change():
+            before = self.source.stat()
+            self.source.write_bytes(b'x' * len(self.RELEASE))
+            os.utime(self.source, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))
+
+        with self.descriptors(), self.after_read(change), \
+                self.assertRaisesRegex(p.VerificationError, 'changed during read'):
+            s._os_release(self.root)
+
+    def test_target_path_replacement_after_read_fails(self):
+        replacement = self.source.with_name('replacement')
+        replacement.write_bytes(self.RELEASE)
+        with self.descriptors(), self.after_read(lambda: os.replace(replacement, self.source)), \
+                self.assertRaisesRegex(p.VerificationError, 'OS release .*changed'):
+            s._os_release(self.root)
+
+    def test_source_link_replacement_after_vendor_read_fails(self):
+        self.link()
+
+        def change():
+            self.source.unlink()
+            self.source.symlink_to('/usr/lib/os-release')
+
+        with self.descriptors(), self.after_read(change), \
+                self.assertRaisesRegex(p.VerificationError, '/etc/os-release changed'):
+            s._os_release(self.root)
+
+    def test_link_text_change_after_final_stat_fails(self):
+        self.link()
+        with self.descriptors(), patch.object(s.os, 'readlink', side_effect=[
+                '../usr/lib/os-release', '/usr/lib/os-release']), \
+                self.assertRaisesRegex(p.VerificationError, 'link changed'):
+            s._os_release(self.root)
+
+    def test_permission_error_propagates_and_closes_acquired_descriptors(self):
+        def opened(name, flags, **kwargs):
+            if name == 'os-release':
+                raise PermissionError(errno.EACCES, 'synthetic permission denial')
+            return original(name, flags, **kwargs)
+
+        with self.descriptors():
+            original = os.open
+            with patch.object(s.os, 'open', wraps=opened), \
+                    self.assertRaises(PermissionError) as caught:
+                s._os_release(self.root)
+        self.assertEqual(caught.exception.errno, errno.EACCES)
+
+    def test_read_error_propagates_and_closes_all_descriptors(self):
+        def fail():
+            raise OSError(errno.EIO, 'synthetic read failure')
+
+        with self.descriptors(), self.after_read(fail), self.assertRaises(OSError) as caught:
+            s._os_release(self.root)
+        self.assertEqual(caught.exception.errno, errno.EIO)
+
+    def test_fstat_error_propagates_and_closes_all_descriptors(self):
+        with self.descriptors(), \
+                patch.object(s.os, 'fstat', side_effect=OSError(errno.EIO, 'stat')):
+            with self.assertRaises(OSError) as caught:
+                s._os_release(self.root)
+        self.assertEqual(caught.exception.errno, errno.EIO)
+
+    def test_artifact_readers_continue_rejecting_the_accepted_os_link(self):
+        self.link()
+        for reader in (s.bounded, s.read_json, s.sha):
+            with self.subTest(reader=reader.__name__), self.assertRaisesRegex(
+                    p.VerificationError, 'Regular file required'):
+                reader(self.source)
+        with self.assertRaisesRegex(p.VerificationError, 'Symlink in evidence'):
+            s.inventory(self.root)
+        directory_link = self.root / 'evidence-link'
+        directory_link.symlink_to(self.root / 'usr', target_is_directory=True)
+        with self.assertRaisesRegex(p.VerificationError, 'directory symlink'):
+            s.inventory(directory_link)
+
+    def target(self):
+        """Run target() with private OS files and mocked read-only system queries."""
+        _, _, plan = fixture()
+        values = {Path('/proc/device-tree/compatible'): b'apple,j293\0apple,t8103\0'}
+        values.update({Path(f'/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1'):
+                       midr.encode() for cpu, midr in p.MIDRS.items()})
+        actual_reader = s._os_release
+        with ExitStack() as stack:
+            for name, value in (('system', 'Linux'), ('machine', 'aarch64'),
+                                ('release', plan['kernel_release'])):
+                stack.enter_context(patch.object(s.platform, name, return_value=value))
+            for name, value in (('sysconf', 16384), ('sched_getaffinity', {0, 4}),
+                                ('geteuid', 1000)):
+                stack.enter_context(patch.object(s.os, name, return_value=value))
+            stack.enter_context(patch.object(s.sys, 'byteorder', 'little'))
+            limit = stack.enter_context(patch.object(s.resource, 'prlimit', return_value=(1, 1)))
+            reader = stack.enter_context(patch.object(
+                s, '_os_release', side_effect=lambda: actual_reader(self.root)))
+            bounded = stack.enter_context(patch.object(
+                s, 'bounded', side_effect=lambda path, _limit: values[path]))
+            # A real disposable FD permits target's close without mocking os.close.
+            with self.vendor.open('rb') as anchor:
+                pidfd = stack.enter_context(patch.object(
+                    s.os, 'pidfd_open', side_effect=lambda _pid: os.dup(anchor.fileno())))
+                result = s.target(plan)
+            reader.assert_called_once_with()
+            self.assertEqual(bounded.call_args_list, [
+                call(Path('/proc/device-tree/compatible'), 4096),
+                call(Path('/sys/devices/system/cpu/cpu0/regs/identification/midr_el1'), 128),
+                call(Path('/sys/devices/system/cpu/cpu4/regs/identification/midr_el1'), 128)])
+            pidfd.assert_called_once_with(os.getpid())
+            limit.assert_called_once_with(os.getpid(), s.resource.RLIMIT_CPU)
+            return result
+
+    def test_target_integration_accepts_private_regular_and_both_link_layouts(self):
+        for text in (None, '../usr/lib/os-release', '/usr/lib/os-release'):
+            with self.subTest(link=text):
+                if text is not None:
+                    self.source.unlink()
+                    self.source.symlink_to(text)
+                self.assertEqual(self.target()['os_release'], self.RELEASE.decode())
+
+    def test_target_rejects_incompatible_os_contents(self):
+        self.source.write_bytes(b'ID=fedora\nVERSION_ID=45\nID_LIKE=fedora\n')
+        with self.assertRaisesRegex(p.VerificationError, 'Fedora Asahi'):
+            self.target()
+
+    def test_target_rejects_empty_or_invalid_utf8(self):
+        for data, error in ((b'', p.VerificationError), (b'\xff', UnicodeDecodeError)):
+            with self.subTest(data=data):
+                self.source.write_bytes(data)
+                with self.assertRaises(error):
+                    self.target()
 
 
 class SupervisorTest(unittest.TestCase):
@@ -620,7 +981,8 @@ class SupervisorTest(unittest.TestCase):
         identity['cpus']['0']['midr'] = p.MIDRS[4]
         with self.assertRaises(p.VerificationError):
             s.check_identity(identity, plan, 1000)
-        with patch.object(s, 'bounded', side_effect=FileNotFoundError('unavailable')):
+        with patch.object(s, '_os_release', return_value=identity['os_release'].encode()), \
+                patch.object(s, 'bounded', side_effect=FileNotFoundError('unavailable')):
             with self.assertRaises(FileNotFoundError):
                 s.target(plan)
 

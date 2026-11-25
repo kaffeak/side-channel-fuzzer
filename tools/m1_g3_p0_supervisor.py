@@ -4,7 +4,7 @@ Self-test builds only the separate synthetic backend. No imports launch experime
 """
 # pylint: disable=missing-function-docstring,too-many-locals
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -18,6 +18,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -258,12 +259,65 @@ def verify_commands(commands, linker):
                              [readelf, '-hW', '-lW', binary]], 'Unexpected verification commands')
 
 
+def _os_release(root=Path('/')):
+    """Read the fixed OS identity location, not an arbitrary artifact symlink.
+
+    root is only for private filesystem fixtures; target() always uses '/'.
+    Vendor symlink chains and unexpected directory links fail closed.
+    """
+    def signature(value):
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns)
+
+    directories = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    files = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    with ExitStack() as cleanup:
+        def opened(name, flags, parent=None):
+            descriptor = os.open(name, flags, dir_fd=parent)
+            cleanup.callback(os.close, descriptor)
+            return descriptor
+
+        anchor = opened(root, directories)
+        etc = opened('etc', directories, anchor)
+        before = os.stat('os-release', dir_fd=etc, follow_symlinks=False)
+        link = None
+        parent = etc
+        selected = before
+        if stat.S_ISLNK(before.st_mode):
+            link = os.readlink('os-release', dir_fd=etc)
+            REQUIRE(link in ('../usr/lib/os-release', '/usr/lib/os-release'),
+                    'Unexpected /etc/os-release symlink target')
+            usr = opened('usr', directories, anchor)
+            parent = opened('lib', directories, usr)
+            selected = os.stat('os-release', dir_fd=parent, follow_symlinks=False)
+        REQUIRE(stat.S_ISREG(selected.st_mode), 'Regular OS release target required')
+        descriptor = opened('os-release', files, parent)
+        metadata = os.fstat(descriptor)
+        REQUIRE(stat.S_ISREG(metadata.st_mode), 'Regular OS release target required')
+        REQUIRE(signature(selected) == signature(metadata), 'OS release changed before open')
+        with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            data = stream.read(4097)
+        REQUIRE(len(data) <= 4096, 'Oversized OS release')
+        REQUIRE(signature(metadata) == signature(os.fstat(descriptor)),
+                'OS release changed during read')
+        REQUIRE(signature(metadata) == signature(
+            os.stat('os-release', dir_fd=parent, follow_symlinks=False)),
+            'OS release target path changed')
+        REQUIRE(signature(before) == signature(
+            os.stat('os-release', dir_fd=etc, follow_symlinks=False)),
+            '/etc/os-release changed during read')
+        if link is not None:
+            REQUIRE(os.readlink('os-release', dir_fd=etc) == link,
+                    '/etc/os-release link changed during read')
+        return data
+
+
 def target(plan):
     """Non-measurement identity reads only. Does not execute the worker."""
     identity = {'system': platform.system(), 'architecture': platform.machine(),
                 'page_size': os.sysconf('SC_PAGESIZE'), 'kernel_release': platform.release(),
                 'allowed_cpus': sorted(os.sched_getaffinity(0)),
-                'os_release': bounded(Path('/etc/os-release'), 4096).decode(),
+                'os_release': _os_release().decode(),
                 'compatible': bounded(Path('/proc/device-tree/compatible'), 4096)
                 .decode().rstrip('\0').split('\0'), 'cpus': {}}
     for cpu in (0, 4):
